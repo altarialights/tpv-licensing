@@ -1,55 +1,31 @@
-export type ChatMessage = {
-	id: string;
-	content: string;
-	user: string;
-	role: "user" | "assistant";
+// src/shared.ts
+
+export type LicenseStatus = "active" | "expired" | "disabled" | "invalid";
+
+export type ActivateRequest = {
+	activationKey: string;   // la key que te da Lemon
+	deviceId: string;        // hash estable del hardware (o lo que uses)
+	instanceName?: string;   // opcional (nombre legible)
 };
 
-export type Message =
-	| {
-			type: "add";
-			id: string;
-			content: string;
-			user: string;
-			role: "user" | "assistant";
-	  }
-	| {
-			type: "update";
-			id: string;
-			content: string;
-			user: string;
-			role: "user" | "assistant";
-	  }
-	| {
-			type: "all";
-			messages: ChatMessage[];
-	  };
+export type ActivateResponse = {
+	ok: true;
+	tenantId: string;        // tu id interno (por restaurante)
+	token: string;           // JWT para llamadas futuras
+	status: LicenseStatus;
+	expiresAt: string | null;
+};
 
-export const names = [
-	"Alice",
-	"Bob",
-	"Charlie",
-	"David",
-	"Eve",
-	"Frank",
-	"Grace",
-	"Heidi",
-	"Ivan",
-	"Judy",
-	"Kevin",
-	"Linda",
-	"Mallory",
-	"Nancy",
-	"Oscar",
-	"Peggy",
-	"Quentin",
-	"Randy",
-	"Steve",
-	"Trent",
-	"Ursula",
-	"Victor",
-	"Walter",
-	"Xavier",
-	"Yvonne",
-	"Zoe",
-];
+export type ApiError = { ok: false; error: string };
+
+export type LemonWebhookPayload = {
+	meta?: {
+		event_name?: string;
+		custom_data?: Record<string, any>;
+	};
+	data?: {
+		type?: string;
+		id?: string;
+		attributes?: Record<string, any>;
+	};
+};
