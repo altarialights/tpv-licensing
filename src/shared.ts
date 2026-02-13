@@ -1,31 +1,36 @@
-// src/shared.ts
+export type LicenseStatus =
+	| "active"
+	| "inactive"
+	| "expired"
+	| "disabled"
+	| "invalid";
 
-export type LicenseStatus = "active" | "expired" | "disabled" | "invalid";
+export type ApiError = {
+	ok: false;
+	error: string;
+	details?: any;
+};
 
 export type ActivateRequest = {
-	activationKey: string;   // la key que te da Lemon
-	deviceId: string;        // hash estable del hardware (o lo que uses)
-	instanceName?: string;   // opcional (nombre legible)
+	activationKey: string; // la license key que mete el cliente
+	deviceId: string;      // id único del dispositivo (tpv main)
+	instanceName?: string; // opcional (si no, se genera)
 };
 
 export type ActivateResponse = {
 	ok: true;
-	tenantId: string;        // tu id interno (por restaurante)
-	token: string;           // JWT para llamadas futuras
+	tenantId: string;
+	token: string;         // JWT para siguientes llamadas
 	status: LicenseStatus;
 	expiresAt: string | null;
 };
 
-export type ApiError = { ok: false; error: string };
-
 export type LemonWebhookPayload = {
 	meta?: {
 		event_name?: string;
-		custom_data?: Record<string, any>;
+		test_mode?: boolean;
 	};
 	data?: {
-		type?: string;
-		id?: string;
 		attributes?: Record<string, any>;
 	};
 };

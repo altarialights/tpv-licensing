@@ -1,26 +1,20 @@
 {
-	"compatibility_date": "2025-10-08",
-	"main": "src/server/index.ts",
 	"name": "tpv-licensing",
+	"main": "src/server/index.ts",
+	"compatibility_date": "2025-10-08",
 	"migrations": [
 		{
-			"new_sqlite_classes": ["Chat"],
-			"tag": "v1"
+			"tag": "v1",
+			"new_sqlite_classes": [
+				"Chat"
+			]
 		}
 	],
-	"assets": {
-		"directory": "./public",
-		"binding": "ASSETS",
-		"not_found_handling": "single-page-application"
-	},
-	"build": {
-		"command": "esbuild src/client/index.tsx --bundle --splitting --format=esm --platform=browser --outdir=public/dist"
-	},
 	"durable_objects": {
 		"bindings": [
 			{
-				"class_name": "Chat",
-				"name": "Chat"
+				"name": "Chat",
+				"class_name": "Chat"
 			}
 		]
 	},

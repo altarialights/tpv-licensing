@@ -1,10 +1,6 @@
-// src/server/chat.ts
-// Durable Object: almacén de licencias (SQLite storage)
-
 import type { LicenseStatus } from "../shared";
 
 export interface Env {
-	// claves del worker (las define el worker principal, aquí solo se tipan)
 	LICENSE_STORE_KEY: string; // base64 32 bytes
 }
 
@@ -72,8 +68,8 @@ type StateRow = {
 	instance_id: string | null;
 	status: LicenseStatus;
 	expires_at: string | null;
-	license_key_enc: string;     // cifrado
-	meta_json: string | null;    // json string
+	license_key_enc: string;
+	meta_json: string | null;
 	updated_at: number;
 	created_at: number;
 };
@@ -82,7 +78,6 @@ export class Chat {
 	constructor(private state: DurableObjectState, private env: Env) { }
 
 	private ensureSchema() {
-		// SQLite DO storage
 		this.state.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS license_state (
         id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -103,17 +98,17 @@ export class Chat {
 		this.ensureSchema();
 		const url = new URL(request.url);
 
-		if (url.pathname === "/internal/get" && request.method === "GET") {
+		// OJO: rutas SIN /internal (para que cuadren con https://do/get)
+		if (url.pathname === "/get" && request.method === "GET") {
 			const row = this.state.storage.sql
 				.exec(`SELECT * FROM license_state WHERE id=1 LIMIT 1;`)
 				.toArray()[0] as StateRow | undefined;
 
 			if (!row) return json({ ok: false, error: "not_found" }, 404);
-
 			return json({ ok: true, row });
 		}
 
-		if (url.pathname === "/internal/upsert" && request.method === "POST") {
+		if (url.pathname === "/upsert" && request.method === "POST") {
 			const body = await readJsonSafe(request, {
 				tenantId: "",
 				deviceId: "",
@@ -160,7 +155,7 @@ export class Chat {
 			return json({ ok: true });
 		}
 
-		if (url.pathname === "/internal/get-decrypted" && request.method === "GET") {
+		if (url.pathname === "/get-decrypted" && request.method === "GET") {
 			const row = this.state.storage.sql
 				.exec(`SELECT * FROM license_state WHERE id=1 LIMIT 1;`)
 				.toArray()[0] as StateRow | undefined;

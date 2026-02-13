@@ -1,18 +1,21 @@
-// src/server/index.ts
-
 import { SignJWT, jwtVerify } from "jose";
-import type { ActivateRequest, ActivateResponse, ApiError, LemonWebhookPayload, LicenseStatus } from "../shared";
+import type {
+	ActivateRequest,
+	ActivateResponse,
+	ApiError,
+	LemonWebhookPayload,
+	LicenseStatus,
+} from "../shared";
 import { Chat } from "./chat";
 
 export { Chat };
 
 export interface Env {
-	// Secrets
-	LEMON_WEBHOOK_SECRET: string; // el "Signing secret" del webhook
-	LICENSE_JWT_SECRET: string;   // para firmar tokens (JWT)
+	// Secrets (ponlos como secrets/vars en Cloudflare)
+	LEMON_WEBHOOK_SECRET: string; // "Signing secret" del webhook
+	LICENSE_JWT_SECRET: string;   // para firmar JWT
 	LICENSE_STORE_KEY: string;    // base64 32 bytes (AES-GCM)
 
-	// DO binding (lo deja el template)
 	Chat: DurableObjectNamespace;
 }
 
@@ -54,7 +57,9 @@ async function signToken(env: Env, claims: { tenantId: string; deviceId: string;
 }
 
 async function verifyToken(env: Env, token: string) {
-	const { payload } = await jwtVerify(token, secretKey(env.LICENSE_JWT_SECRET), { algorithms: ["HS256"] });
+	const { payload } = await jwtVerify(token, secretKey(env.LICENSE_JWT_SECRET), {
+		algorithms: ["HS256"],
+	});
 
 	const tenantId = String(payload.tenantId || "");
 	const deviceId = String(payload.deviceId || "");
@@ -78,7 +83,7 @@ function timingSafeEqualHex(a: string, b: string) {
 }
 
 async function verifyLemonSignature(req: Request, secret: string, rawBody: string) {
-	// Lemon usa HMAC SHA256 y lo manda como HEX en X-Signature :contentReference[oaicite:3]{index=3}
+	// Lemon firma con HMAC SHA-256 y lo manda como HEX en X-Signature :contentReference[oaicite:5]{index=5}
 	const sig = (req.headers.get("X-Signature") || "").trim();
 	if (!sig) return false;
 
@@ -97,13 +102,13 @@ async function verifyLemonSignature(req: Request, secret: string, rawBody: strin
 }
 
 function getLicenseStub(env: Env, licHash: string) {
-	// DO por licencia (un DO = 1 licencia)
+	// 1 DO por licencia (licHash)
 	const id = env.Chat.idFromName("lic:" + licHash);
 	return env.Chat.get(id);
 }
 
 // ---------------- Lemon License API ----------------
-// Docs: activate / validate / deactivate :contentReference[oaicite:4]{index=4}
+// Docs oficiales (License API) 
 
 async function lemonActivate(licenseKey: string, instanceName: string) {
 	const body = new URLSearchParams();
@@ -122,7 +127,6 @@ async function lemonActivate(licenseKey: string, instanceName: string) {
 	const text = await r.text();
 	let data: any = null;
 	try { data = JSON.parse(text); } catch { }
-
 	return { ok: r.ok, status: r.status, data, text };
 }
 
@@ -143,7 +147,6 @@ async function lemonValidate(licenseKey: string, instanceId?: string | null) {
 	const text = await r.text();
 	let data: any = null;
 	try { data = JSON.parse(text); } catch { }
-
 	return { ok: r.ok, status: r.status, data, text };
 }
 
@@ -172,10 +175,9 @@ export default {
 			}
 
 			const eventName = String(payload?.meta?.event_name || "");
-			// Para test, nos interesa sobre todo license_key_created / license_key_updated :contentReference[oaicite:5]{index=5}
-
-			// Intentamos extraer el "key" de la licencia si viene en el webhook
 			const attrs = payload?.data?.attributes || {};
+
+			// En license_key_created suele venir attrs.key y attrs.status :contentReference[oaicite:7]{index=7}
 			const licenseKey = String((attrs as any).key || "").trim();
 			const status = String((attrs as any).status || "").trim() as LicenseStatus;
 			const expiresAt = (attrs as any).expires_at ? String((attrs as any).expires_at) : null;
@@ -184,30 +186,14 @@ export default {
 				const licHash = await sha256Hex(licenseKey);
 				const stub = getLicenseStub(env, licHash);
 
-				// guardamos/actualizamos lo que sepamos
-				// tenantId aún puede no existir si nadie “activó” en app.
-				// Lo dejamos vacío si no existe (se rellenará al activar).
-				const current = await stub.fetch("https://internal/get", { method: "GET" });
-
-				let tenantId = "";
-				let deviceId = "";
-				let instanceId: string | null = null;
-
-				if (current.ok) {
-					const cur = await current.json<any>();
-					tenantId = cur?.row?.tenant_id || "";
-					deviceId = cur?.row?.device_id || "";
-					instanceId = cur?.row?.instance_id ?? null;
-				}
-
-				// Si no hay tenantId todavía, no pasa nada: guardamos con tenant vacío
-				await stub.fetch("https://internal/upsert", {
+				// Guardamos con placeholders si aún no hay activación en app
+				await stub.fetch("https://do/upsert", {
 					method: "POST",
 					headers: { "content-type": "application/json" },
 					body: JSON.stringify({
-						tenantId: tenantId || "PENDING",
-						deviceId: deviceId || "PENDING",
-						instanceId,
+						tenantId: "PENDING",
+						deviceId: "PENDING",
+						instanceId: null,
 						status: (status || "active") as LicenseStatus,
 						expiresAt,
 						licenseKey,
@@ -216,7 +202,6 @@ export default {
 				});
 			}
 
-			// Lemon considera “capturado” si devuelves 200; si no, reintenta con backoff :contentReference[oaicite:6]{index=6}
 			return json({ ok: true, received: true, eventName });
 		}
 
@@ -239,14 +224,12 @@ export default {
 				return json(out, 400);
 			}
 
-			// 2.1) Activar contra Lemon
 			const act = await lemonActivate(activationKey, instanceName);
 			if (!act.ok) {
-				const out: ApiError = { ok: false, error: act.data?.error || "lemon_activate_failed" };
+				const out: ApiError = { ok: false, error: act.data?.error || "lemon_activate_failed", details: act.data || act.text };
 				return json(out, 400);
 			}
 
-			// Respuesta típica: { activated: true, license_key: {...}, instance: {...}, meta: {...} } :contentReference[oaicite:7]{index=7}
 			const licenseKeyObj = act.data?.license_key;
 			const instanceObj = act.data?.instance;
 
@@ -254,22 +237,13 @@ export default {
 			const expiresAt = licenseKeyObj?.expires_at ? String(licenseKeyObj.expires_at) : null;
 			const instanceId = instanceObj?.id ? String(instanceObj.id) : null;
 
-			// 2.2) Guardar en DO
 			const licHash = await sha256Hex(activationKey);
 			const stub = getLicenseStub(env, licHash);
 
-			// Si ya hay tenant asignado, úsalo; si no, crea uno
-			let tenantId = crypto.randomUUID();
-			try {
-				const cur = await stub.fetch("https://internal/get", { method: "GET" });
-				if (cur.ok) {
-					const j = await cur.json<any>();
-					const existing = String(j?.row?.tenant_id || "");
-					if (existing && existing !== "PENDING") tenantId = existing;
-				}
-			} catch { }
+			// tenantId definitivo (uno por cliente/restaurante)
+			const tenantId = crypto.randomUUID();
 
-			await stub.fetch("https://internal/upsert", {
+			await stub.fetch("https://do/upsert", {
 				method: "POST",
 				headers: { "content-type": "application/json" },
 				body: JSON.stringify({
@@ -283,7 +257,6 @@ export default {
 				}),
 			});
 
-			// 2.3) Token para siguientes llamadas
 			const token = await signToken(env, { tenantId, deviceId, licHash });
 
 			const out: ActivateResponse = {
@@ -297,7 +270,7 @@ export default {
 			return json(out);
 		}
 
-		// 3) STATUS (para UI / bloqueo si expira)
+		// 3) STATUS
 		if (url.pathname === "/v1/license/status" && request.method === "GET") {
 			const h = request.headers.get("authorization") || "";
 			const m = h.match(/^Bearer\s+(.+)$/i);
@@ -311,14 +284,14 @@ export default {
 			}
 
 			const stub = getLicenseStub(env, claims.licHash);
-			const cur = await stub.fetch("https://internal/get", { method: "GET" });
+			const cur = await stub.fetch("https://do/get", { method: "GET" });
 			if (!cur.ok) return json({ ok: false, error: "not_found" }, 404);
 
 			const j = await cur.json<any>();
 			return json({ ok: true, state: j.row, serverTime: Date.now() });
 		}
 
-		// 4) VALIDATE (forzar re-check con Lemon)
+		// 4) VALIDATE (re-check con Lemon)
 		if (url.pathname === "/v1/license/validate" && request.method === "POST") {
 			const h = request.headers.get("authorization") || "";
 			const m = h.match(/^Bearer\s+(.+)$/i);
@@ -333,8 +306,7 @@ export default {
 
 			const stub = getLicenseStub(env, claims.licHash);
 
-			// necesitamos la key descifrada para validar
-			const dec = await stub.fetch("https://internal/get-decrypted", { method: "GET" });
+			const dec = await stub.fetch("https://do/get-decrypted", { method: "GET" });
 			if (!dec.ok) return json({ ok: false, error: "not_found" }, 404);
 			const dj = await dec.json<any>();
 
@@ -347,13 +319,13 @@ export default {
 			const status = (val.data?.license_key?.status || "active") as LicenseStatus;
 			const expiresAt = val.data?.license_key?.expires_at ? String(val.data.license_key.expires_at) : null;
 
-			await stub.fetch("https://internal/upsert", {
+			await stub.fetch("https://do/upsert", {
 				method: "POST",
 				headers: { "content-type": "application/json" },
 				body: JSON.stringify({
 					tenantId: dj.row.tenant_id,
 					deviceId: dj.row.device_id,
-					instanceId: instanceId,
+					instanceId,
 					status,
 					expiresAt,
 					licenseKey,
