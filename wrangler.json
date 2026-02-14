@@ -7,6 +7,20 @@
 	},
 	"upload_source_maps": true,
 	"vars": {
-		"TURSO_DATABASE_URL": "libsql://TU_DB-TU_ORG.turso.io"
-	}
+		"TURSO_DATABASE_URL": "libsql://tpvcontrol-altarialights.aws-eu-west-1.turso.io"
+	},
+	"migrations": [
+		{
+			"tag": "v1",
+			"new_sqlite_classes": [
+				"Chat"
+			]
+		},
+		{
+			"tag": "v2",
+			"deleted_classes": [
+				"Chat"
+			]
+		}
+	]
 }
