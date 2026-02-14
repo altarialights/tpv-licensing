@@ -11,10 +11,10 @@ import { Chat } from "./chat";
 export { Chat };
 
 export interface Env {
-	// Secrets (ponlos como secrets/vars en Cloudflare)
-	LEMON_WEBHOOK_SECRET: string; // "Signing secret" del webhook
+	// Secrets (Cloudflare -> Settings -> Variables and Secrets)
+	LEMON_WEBHOOK_SECRET: string; // Signing secret del webhook
 	LICENSE_JWT_SECRET: string;   // para firmar JWT
-	LICENSE_STORE_KEY: string;    // base64 32 bytes (AES-GCM)
+	LICENSE_STORE_KEY: string;    // base64 32 bytes (AES-GCM) - lo usa el DO
 
 	Chat: DurableObjectNamespace;
 }
@@ -46,6 +46,16 @@ async function readJsonSafe<T>(req: Request, fallback: T): Promise<T> {
 
 function secretKey(str: string) {
 	return new TextEncoder().encode(str);
+}
+
+function assertEnv(env: Env, names: (keyof Env)[]) {
+	for (const n of names) {
+		const v = (env as any)[n];
+		if (!v || String(v).trim().length === 0) {
+			return `missing_env_${String(n)}`;
+		}
+	}
+	return null;
 }
 
 async function signToken(env: Env, claims: { tenantId: string; deviceId: string; licHash: string }) {
@@ -83,8 +93,13 @@ function timingSafeEqualHex(a: string, b: string) {
 }
 
 async function verifyLemonSignature(req: Request, secret: string, rawBody: string) {
-	// Lemon firma con HMAC SHA-256 y lo manda como HEX en X-Signature :contentReference[oaicite:5]{index=5}
-	const sig = (req.headers.get("X-Signature") || "").trim();
+	const sig = (req.headers.get("X-Signature") || "").trim().toLowerCase();
+
+	// Si el secret no está configurado, NO revientes: devuelve false y log.
+	if (!secret || secret.trim().length === 0) {
+		console.log("[LEMON] Missing LEMON_WEBHOOK_SECRET in env");
+		return false;
+	}
 	if (!sig) return false;
 
 	const key = await crypto.subtle.importKey(
@@ -102,13 +117,19 @@ async function verifyLemonSignature(req: Request, secret: string, rawBody: strin
 }
 
 function getLicenseStub(env: Env, licHash: string) {
-	// 1 DO por licencia (licHash)
+	// 1 DO por licencia
 	const id = env.Chat.idFromName("lic:" + licHash);
 	return env.Chat.get(id);
 }
 
+async function doFetch(stub: DurableObjectStub, path: string, init?: RequestInit) {
+	// IMPORTANTE: el pathname debe ser EXACTO (por eso usamos /internal/...)
+	const url = `https://license${path}`;
+	const r = await stub.fetch(url, init);
+	return r;
+}
+
 // ---------------- Lemon License API ----------------
-// Docs oficiales (License API) 
 
 async function lemonActivate(licenseKey: string, instanceName: string) {
 	const body = new URLSearchParams();
@@ -162,7 +183,18 @@ export default {
 
 		// 1) WEBHOOK Lemon
 		if (url.pathname === "/v1/webhooks/lemon" && request.method === "POST") {
+			// Para webhook SOLO necesitas LEMON_WEBHOOK_SECRET
+			const miss = assertEnv(env, ["LEMON_WEBHOOK_SECRET"]);
+			if (miss) return json({ ok: false, error: miss }, 500);
+
 			const raw = await request.text();
+
+			// Log mínimo para ver que entra
+			console.log("[LEMON] webhook hit", {
+				ts: Date.now(),
+				sigPresent: Boolean((request.headers.get("X-Signature") || "").trim()),
+				bytes: raw.length,
+			});
 
 			const validSig = await verifyLemonSignature(request, env.LEMON_WEBHOOK_SECRET, raw);
 			if (!validSig) return json({ ok: false, error: "invalid_signature" }, 401);
@@ -177,17 +209,17 @@ export default {
 			const eventName = String(payload?.meta?.event_name || "");
 			const attrs = payload?.data?.attributes || {};
 
-			// En license_key_created suele venir attrs.key y attrs.status :contentReference[oaicite:7]{index=7}
 			const licenseKey = String((attrs as any).key || "").trim();
 			const status = String((attrs as any).status || "").trim() as LicenseStatus;
 			const expiresAt = (attrs as any).expires_at ? String((attrs as any).expires_at) : null;
+
+			console.log("[LEMON] event", { eventName, hasKey: Boolean(licenseKey), status, expiresAt });
 
 			if (licenseKey) {
 				const licHash = await sha256Hex(licenseKey);
 				const stub = getLicenseStub(env, licHash);
 
-				// Guardamos con placeholders si aún no hay activación en app
-				await stub.fetch("https://do/upsert", {
+				const up = await doFetch(stub, "/internal/upsert", {
 					method: "POST",
 					headers: { "content-type": "application/json" },
 					body: JSON.stringify({
@@ -200,6 +232,13 @@ export default {
 						meta: { eventName, payload },
 					}),
 				});
+
+				if (!up.ok) {
+					const t = await up.text().catch(() => "");
+					console.log("[LEMON] DO upsert failed", { status: up.status, body: t.slice(0, 300) });
+					// Si devuelves 500, Lemon reintenta (útil si hay fallos temporales)
+					return json({ ok: false, error: "do_upsert_failed" }, 500);
+				}
 			}
 
 			return json({ ok: true, received: true, eventName });
@@ -207,13 +246,17 @@ export default {
 
 		// 2) ACTIVAR (TPV MAIN)
 		if (url.pathname === "/v1/license/activate" && request.method === "POST") {
+			const miss = assertEnv(env, ["LICENSE_JWT_SECRET", "LICENSE_STORE_KEY"]);
+			if (miss) return json({ ok: false, error: miss }, 500);
+
 			const err = requireJson(request);
 			if (err) return err;
 
 			const body = await readJsonSafe<ActivateRequest>(request, {
 				activationKey: "",
 				deviceId: "",
-			});
+				instanceName: undefined,
+			} as any);
 
 			const activationKey = String(body.activationKey || "").trim();
 			const deviceId = String(body.deviceId || "").trim();
@@ -226,7 +269,11 @@ export default {
 
 			const act = await lemonActivate(activationKey, instanceName);
 			if (!act.ok) {
-				const out: ApiError = { ok: false, error: act.data?.error || "lemon_activate_failed", details: act.data || act.text };
+				const out: ApiError = {
+					ok: false,
+					error: act.data?.error || "lemon_activate_failed",
+					details: act.data || act.text,
+				};
 				return json(out, 400);
 			}
 
@@ -240,10 +287,18 @@ export default {
 			const licHash = await sha256Hex(activationKey);
 			const stub = getLicenseStub(env, licHash);
 
-			// tenantId definitivo (uno por cliente/restaurante)
-			const tenantId = crypto.randomUUID();
+			// Si ya existe tenantId en DO (por webhook anterior), lo reutilizamos
+			let tenantId = crypto.randomUUID();
+			try {
+				const cur = await doFetch(stub, "/internal/get", { method: "GET" });
+				if (cur.ok) {
+					const j = await cur.json<any>();
+					const existing = String(j?.row?.tenant_id || "");
+					if (existing && existing !== "PENDING") tenantId = existing;
+				}
+			} catch { }
 
-			await stub.fetch("https://do/upsert", {
+			const up = await doFetch(stub, "/internal/upsert", {
 				method: "POST",
 				headers: { "content-type": "application/json" },
 				body: JSON.stringify({
@@ -256,6 +311,11 @@ export default {
 					meta: act.data?.meta || null,
 				}),
 			});
+
+			if (!up.ok) {
+				const t = await up.text().catch(() => "");
+				return json({ ok: false, error: "do_upsert_failed", details: t.slice(0, 300) }, 500);
+			}
 
 			const token = await signToken(env, { tenantId, deviceId, licHash });
 
@@ -272,6 +332,9 @@ export default {
 
 		// 3) STATUS
 		if (url.pathname === "/v1/license/status" && request.method === "GET") {
+			const miss = assertEnv(env, ["LICENSE_JWT_SECRET"]);
+			if (miss) return json({ ok: false, error: miss }, 500);
+
 			const h = request.headers.get("authorization") || "";
 			const m = h.match(/^Bearer\s+(.+)$/i);
 			if (!m) return json({ ok: false, error: "missing_token" }, 401);
@@ -284,7 +347,7 @@ export default {
 			}
 
 			const stub = getLicenseStub(env, claims.licHash);
-			const cur = await stub.fetch("https://do/get", { method: "GET" });
+			const cur = await doFetch(stub, "/internal/get", { method: "GET" });
 			if (!cur.ok) return json({ ok: false, error: "not_found" }, 404);
 
 			const j = await cur.json<any>();
@@ -293,6 +356,9 @@ export default {
 
 		// 4) VALIDATE (re-check con Lemon)
 		if (url.pathname === "/v1/license/validate" && request.method === "POST") {
+			const miss = assertEnv(env, ["LICENSE_JWT_SECRET", "LICENSE_STORE_KEY"]);
+			if (miss) return json({ ok: false, error: miss }, 500);
+
 			const h = request.headers.get("authorization") || "";
 			const m = h.match(/^Bearer\s+(.+)$/i);
 			if (!m) return json({ ok: false, error: "missing_token" }, 401);
@@ -306,7 +372,7 @@ export default {
 
 			const stub = getLicenseStub(env, claims.licHash);
 
-			const dec = await stub.fetch("https://do/get-decrypted", { method: "GET" });
+			const dec = await doFetch(stub, "/internal/get-decrypted", { method: "GET" });
 			if (!dec.ok) return json({ ok: false, error: "not_found" }, 404);
 			const dj = await dec.json<any>();
 
@@ -319,7 +385,7 @@ export default {
 			const status = (val.data?.license_key?.status || "active") as LicenseStatus;
 			const expiresAt = val.data?.license_key?.expires_at ? String(val.data.license_key.expires_at) : null;
 
-			await stub.fetch("https://do/upsert", {
+			const up = await doFetch(stub, "/internal/upsert", {
 				method: "POST",
 				headers: { "content-type": "application/json" },
 				body: JSON.stringify({
@@ -332,6 +398,11 @@ export default {
 					meta: val.data?.meta || null,
 				}),
 			});
+
+			if (!up.ok) {
+				const t = await up.text().catch(() => "");
+				return json({ ok: false, error: "do_upsert_failed", details: t.slice(0, 300) }, 500);
+			}
 
 			return json({ ok: true, status, expiresAt, valid: val.data?.valid, meta: val.data?.meta });
 		}

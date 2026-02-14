@@ -34,7 +34,7 @@ function bytesToB64(bytes: Uint8Array): string {
 
 async function aesGcmEncrypt(keyB64: string, plaintext: string): Promise<string> {
 	const keyBytes = b64ToBytes(keyB64);
-	if (keyBytes.length !== 32) throw new Error("LICENSE_STORE_KEY must be 32 bytes base64");
+	if (keyBytes.length !== 32) throw new Error("LICENSE_STORE_KEY must decode to 32 bytes");
 
 	const key = await crypto.subtle.importKey("raw", keyBytes, "AES-GCM", false, ["encrypt"]);
 	const iv = crypto.getRandomValues(new Uint8Array(12));
@@ -50,7 +50,7 @@ async function aesGcmEncrypt(keyB64: string, plaintext: string): Promise<string>
 
 async function aesGcmDecrypt(keyB64: string, cipherB64: string): Promise<string> {
 	const keyBytes = b64ToBytes(keyB64);
-	if (keyBytes.length !== 32) throw new Error("LICENSE_STORE_KEY must be 32 bytes base64");
+	if (keyBytes.length !== 32) throw new Error("LICENSE_STORE_KEY must decode to 32 bytes");
 
 	const raw = b64ToBytes(cipherB64);
 	const iv = raw.slice(0, 12);
@@ -98,8 +98,7 @@ export class Chat {
 		this.ensureSchema();
 		const url = new URL(request.url);
 
-		// OJO: rutas SIN /internal (para que cuadren con https://do/get)
-		if (url.pathname === "/get" && request.method === "GET") {
+		if (url.pathname === "/internal/get" && request.method === "GET") {
 			const row = this.state.storage.sql
 				.exec(`SELECT * FROM license_state WHERE id=1 LIMIT 1;`)
 				.toArray()[0] as StateRow | undefined;
@@ -108,7 +107,7 @@ export class Chat {
 			return json({ ok: true, row });
 		}
 
-		if (url.pathname === "/upsert" && request.method === "POST") {
+		if (url.pathname === "/internal/upsert" && request.method === "POST") {
 			const body = await readJsonSafe(request, {
 				tenantId: "",
 				deviceId: "",
@@ -155,7 +154,7 @@ export class Chat {
 			return json({ ok: true });
 		}
 
-		if (url.pathname === "/get-decrypted" && request.method === "GET") {
+		if (url.pathname === "/internal/get-decrypted" && request.method === "GET") {
 			const row = this.state.storage.sql
 				.exec(`SELECT * FROM license_state WHERE id=1 LIMIT 1;`)
 				.toArray()[0] as StateRow | undefined;
