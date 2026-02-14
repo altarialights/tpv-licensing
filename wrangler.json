@@ -2,24 +2,11 @@
 	"name": "tpv-licensing",
 	"main": "src/server/index.ts",
 	"compatibility_date": "2025-10-08",
-	"migrations": [
-		{
-			"tag": "v1",
-			"new_sqlite_classes": [
-				"Chat"
-			]
-		}
-	],
-	"durable_objects": {
-		"bindings": [
-			{
-				"name": "Chat",
-				"class_name": "Chat"
-			}
-		]
-	},
 	"observability": {
 		"enabled": true
 	},
-	"upload_source_maps": true
+	"upload_source_maps": true,
+	"vars": {
+		"TURSO_DATABASE_URL": "libsql://TU_DB-TU_ORG.turso.io"
+	}
 }

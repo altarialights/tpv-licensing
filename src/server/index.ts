@@ -1,3 +1,4 @@
+// src/server/index.ts
 import { SignJWT, jwtVerify } from "jose";
 import type {
 	ActivateRequest,
@@ -6,17 +7,28 @@ import type {
 	LemonWebhookPayload,
 	LicenseStatus,
 } from "../shared";
-import { Chat } from "./chat";
 
-export { Chat };
+import { getDb, type TursoEnv } from "./db";
+import {
+	ensureExtraSchema,
+	ensureTenantExistsMinimal,
+	ensureDevice,
+	upsertLicenseFromEventOrActivation,
+	upsertLicenseInstance,
+	getLicenseByHash,
+	getDecryptedLicenseKey,
+	upsertWebhookEvent,
+	markWebhookProcessed,
+} from "./licenseStore";
+import { sha256Hex } from "./crypto";
 
-export interface Env {
-	// Secrets (Cloudflare -> Settings -> Variables and Secrets)
+// ---------------- Env ----------------
+
+export interface Env extends TursoEnv {
+	// Secrets
 	LEMON_WEBHOOK_SECRET: string; // Signing secret del webhook
 	LICENSE_JWT_SECRET: string;   // para firmar JWT
-	LICENSE_STORE_KEY: string;    // base64 32 bytes (AES-GCM) - lo usa el DO
-
-	Chat: DurableObjectNamespace;
+	LICENSE_STORE_KEY: string;    // base64 32 bytes (AES-GCM)
 }
 
 // ---------------- Helpers ----------------
@@ -51,9 +63,7 @@ function secretKey(str: string) {
 function assertEnv(env: Env, names: (keyof Env)[]) {
 	for (const n of names) {
 		const v = (env as any)[n];
-		if (!v || String(v).trim().length === 0) {
-			return `missing_env_${String(n)}`;
-		}
+		if (!v || String(v).trim().length === 0) return `missing_env_${String(n)}`;
 	}
 	return null;
 }
@@ -79,12 +89,6 @@ async function verifyToken(env: Env, token: string) {
 	return { tenantId, deviceId, licHash };
 }
 
-async function sha256Hex(input: string): Promise<string> {
-	const data = new TextEncoder().encode(input);
-	const hash = await crypto.subtle.digest("SHA-256", data);
-	return [...new Uint8Array(hash)].map((b) => b.toString(16).padStart(2, "0")).join("");
-}
-
 function timingSafeEqualHex(a: string, b: string) {
 	if (a.length !== b.length) return false;
 	let out = 0;
@@ -95,7 +99,6 @@ function timingSafeEqualHex(a: string, b: string) {
 async function verifyLemonSignature(req: Request, secret: string, rawBody: string) {
 	const sig = (req.headers.get("X-Signature") || "").trim().toLowerCase();
 
-	// Si el secret no está configurado, NO revientes: devuelve false y log.
 	if (!secret || secret.trim().length === 0) {
 		console.log("[LEMON] Missing LEMON_WEBHOOK_SECRET in env");
 		return false;
@@ -114,19 +117,6 @@ async function verifyLemonSignature(req: Request, secret: string, rawBody: strin
 	const hex = [...new Uint8Array(mac)].map((b) => b.toString(16).padStart(2, "0")).join("");
 
 	return timingSafeEqualHex(hex, sig);
-}
-
-function getLicenseStub(env: Env, licHash: string) {
-	// 1 DO por licencia
-	const id = env.Chat.idFromName("lic:" + licHash);
-	return env.Chat.get(id);
-}
-
-async function doFetch(stub: DurableObjectStub, path: string, init?: RequestInit) {
-	// IMPORTANTE: el pathname debe ser EXACTO (por eso usamos /internal/...)
-	const url = `https://license${path}`;
-	const r = await stub.fetch(url, init);
-	return r;
 }
 
 // ---------------- Lemon License API ----------------
@@ -171,11 +161,18 @@ async function lemonValidate(licenseKey: string, instanceId?: string | null) {
 	return { ok: r.ok, status: r.status, data, text };
 }
 
-// ---------------- Worker Routes ----------------
+// ---------------- Worker ----------------
 
 export default {
 	async fetch(request: Request, env: Env): Promise<Response> {
 		const url = new URL(request.url);
+
+		// DB init (lazy)
+		let db: ReturnType<typeof getDb> | null = null;
+		const get = () => {
+			if (!db) db = getDb(env);
+			return db!;
+		};
 
 		if (url.pathname === "/health") {
 			return json({ ok: true, service: "tpv-licensing", ts: Date.now() });
@@ -183,13 +180,11 @@ export default {
 
 		// 1) WEBHOOK Lemon
 		if (url.pathname === "/v1/webhooks/lemon" && request.method === "POST") {
-			// Para webhook SOLO necesitas LEMON_WEBHOOK_SECRET
-			const miss = assertEnv(env, ["LEMON_WEBHOOK_SECRET"]);
+			const miss = assertEnv(env, ["LEMON_WEBHOOK_SECRET", "TURSO_DATABASE_URL", "TURSO_AUTH_TOKEN", "LICENSE_STORE_KEY"]);
 			if (miss) return json({ ok: false, error: miss }, 500);
 
 			const raw = await request.text();
 
-			// Log mínimo para ver que entra
 			console.log("[LEMON] webhook hit", {
 				ts: Date.now(),
 				sigPresent: Boolean((request.headers.get("X-Signature") || "").trim()),
@@ -199,6 +194,14 @@ export default {
 			const validSig = await verifyLemonSignature(request, env.LEMON_WEBHOOK_SECRET, raw);
 			if (!validSig) return json({ ok: false, error: "invalid_signature" }, 401);
 
+			// idempotencia: event_uid = sha256(sig + body)
+			const sig = (request.headers.get("X-Signature") || "").trim().toLowerCase();
+			const bodySha = await sha256Hex(raw);
+			const eventUid = await sha256Hex(sig + ":" + bodySha);
+
+			const dbi = get();
+			await ensureExtraSchema(dbi);
+
 			let payload: LemonWebhookPayload | null = null;
 			try {
 				payload = JSON.parse(raw);
@@ -207,46 +210,68 @@ export default {
 			}
 
 			const eventName = String(payload?.meta?.event_name || "");
-			const attrs = payload?.data?.attributes || {};
+			const testMode = Boolean(payload?.meta?.test_mode);
 
-			const licenseKey = String((attrs as any).key || "").trim();
-			const status = String((attrs as any).status || "").trim() as LicenseStatus;
-			const expiresAt = (attrs as any).expires_at ? String((attrs as any).expires_at) : null;
+			const resourceType = (payload as any)?.data?.type ? String((payload as any).data.type) : null;
+			const resourceId = (payload as any)?.data?.id ? String((payload as any).data.id) : null;
 
-			console.log("[LEMON] event", { eventName, hasKey: Boolean(licenseKey), status, expiresAt });
+			const idemp = await upsertWebhookEvent(dbi, {
+				event_uid: eventUid,
+				event_name: eventName || "unknown",
+				resource_type: resourceType,
+				resource_id: resourceId,
+				sig_hex: sig || null,
+				body_sha256: bodySha,
+				payload_json: raw,
+			});
 
-			if (licenseKey) {
-				const licHash = await sha256Hex(licenseKey);
-				const stub = getLicenseStub(env, licHash);
-
-				const up = await doFetch(stub, "/internal/upsert", {
-					method: "POST",
-					headers: { "content-type": "application/json" },
-					body: JSON.stringify({
-						tenantId: "PENDING",
-						deviceId: "PENDING",
-						instanceId: null,
-						status: (status || "active") as LicenseStatus,
-						expiresAt,
-						licenseKey,
-						meta: { eventName, payload },
-					}),
-				});
-
-				if (!up.ok) {
-					const t = await up.text().catch(() => "");
-					console.log("[LEMON] DO upsert failed", { status: up.status, body: t.slice(0, 300) });
-					// Si devuelves 500, Lemon reintenta (útil si hay fallos temporales)
-					return json({ ok: false, error: "do_upsert_failed" }, 500);
-				}
+			if (idemp.already) {
+				return json({ ok: true, received: true, eventName, idempotent: true });
 			}
 
-			return json({ ok: true, received: true, eventName });
+			try {
+				const attrs = payload?.data?.attributes || {};
+				const licenseKey = String((attrs as any).key || "").trim();
+				const status = String((attrs as any).status || "unknown").trim() as LicenseStatus;
+				const expiresAt = (attrs as any).expires_at ? String((attrs as any).expires_at) : null;
+
+				console.log("[LEMON] event", { eventName, hasKey: Boolean(licenseKey), status, expiresAt, testMode });
+
+				if (licenseKey) {
+					await upsertLicenseFromEventOrActivation({
+						db: dbi,
+						storeKeyB64: env.LICENSE_STORE_KEY,
+						licenseKeyPlain: licenseKey,
+						tenantId: null, // todavía puede estar sin asignar hasta activar
+						status: (status || "active") as LicenseStatus,
+						expiresAt,
+						testMode,
+
+						lemon_license_key_id: resourceId,
+						lemon_created_at: (attrs as any).created_at ? String((attrs as any).created_at) : null,
+						lemon_updated_at: (attrs as any).updated_at ? String((attrs as any).updated_at) : null,
+
+						// guardamos payload completo como meta (igual que antes)
+						meta: { eventName, payload },
+					});
+				}
+
+				await markWebhookProcessed(dbi, eventUid, true);
+				return json({ ok: true, received: true, eventName });
+			} catch (e: any) {
+				await markWebhookProcessed(dbi, eventUid, false, String(e?.message || e));
+				return json({ ok: false, error: "webhook_processing_failed" }, 500);
+			}
 		}
 
 		// 2) ACTIVAR (TPV MAIN)
 		if (url.pathname === "/v1/license/activate" && request.method === "POST") {
-			const miss = assertEnv(env, ["LICENSE_JWT_SECRET", "LICENSE_STORE_KEY"]);
+			const miss = assertEnv(env, [
+				"LICENSE_JWT_SECRET",
+				"LICENSE_STORE_KEY",
+				"TURSO_DATABASE_URL",
+				"TURSO_AUTH_TOKEN",
+			]);
 			if (miss) return json({ ok: false, error: miss }, 500);
 
 			const err = requireJson(request);
@@ -284,37 +309,57 @@ export default {
 			const expiresAt = licenseKeyObj?.expires_at ? String(licenseKeyObj.expires_at) : null;
 			const instanceId = instanceObj?.id ? String(instanceObj.id) : null;
 
+			const dbi = get();
+			await ensureExtraSchema(dbi);
+
+			// Si ya existe por webhook, reutilizamos tenant_id si ya estaba asignado
 			const licHash = await sha256Hex(activationKey);
-			const stub = getLicenseStub(env, licHash);
+			const existing = await getLicenseByHash(dbi, licHash);
 
-			// Si ya existe tenantId en DO (por webhook anterior), lo reutilizamos
-			let tenantId = crypto.randomUUID();
-			try {
-				const cur = await doFetch(stub, "/internal/get", { method: "GET" });
-				if (cur.ok) {
-					const j = await cur.json<any>();
-					const existing = String(j?.row?.tenant_id || "");
-					if (existing && existing !== "PENDING") tenantId = existing;
-				}
-			} catch { }
+			let tenantId = existing?.tenant_id && existing.tenant_id !== "PENDING" ? existing.tenant_id : crypto.randomUUID();
 
-			const up = await doFetch(stub, "/internal/upsert", {
-				method: "POST",
-				headers: { "content-type": "application/json" },
-				body: JSON.stringify({
-					tenantId,
-					deviceId,
-					instanceId,
-					status,
-					expiresAt,
-					licenseKey: activationKey,
-					meta: act.data?.meta || null,
-				}),
+			// Garantiza tenant y device
+			await ensureTenantExistsMinimal(dbi, tenantId);
+			await ensureDevice(dbi, tenantId, deviceId, "tpv");
+
+			// Upsert licencia (y guardamos meta de activate)
+			const { license } = await upsertLicenseFromEventOrActivation({
+				db: dbi,
+				storeKeyB64: env.LICENSE_STORE_KEY,
+				licenseKeyPlain: activationKey,
+				tenantId,
+				status,
+				expiresAt,
+				testMode: Boolean(act.data?.meta?.test_mode),
+
+				lemon_license_key_id: licenseKeyObj?.id ? String(licenseKeyObj.id) : existing?.lemon_license_key_id ?? null,
+				lemon_customer_id: licenseKeyObj?.customer_id ? String(licenseKeyObj.customer_id) : null,
+				lemon_order_id: licenseKeyObj?.order_id ? String(licenseKeyObj.order_id) : null,
+				lemon_order_item_id: licenseKeyObj?.order_item_id ? String(licenseKeyObj.order_item_id) : null,
+				lemon_store_id: licenseKeyObj?.store_id ? String(licenseKeyObj.store_id) : null,
+				lemon_product_id: licenseKeyObj?.product_id ? String(licenseKeyObj.product_id) : null,
+
+				instances_count: typeof licenseKeyObj?.instances_count === "number" ? licenseKeyObj.instances_count : null,
+				activation_limit: typeof licenseKeyObj?.activation_limit === "number" ? licenseKeyObj.activation_limit : null,
+
+				user_name: licenseKeyObj?.user_name ? String(licenseKeyObj.user_name) : null,
+				user_email: licenseKeyObj?.user_email ? String(licenseKeyObj.user_email) : null,
+
+				lemon_created_at: licenseKeyObj?.created_at ? String(licenseKeyObj.created_at) : null,
+				lemon_updated_at: licenseKeyObj?.updated_at ? String(licenseKeyObj.updated_at) : null,
+
+				meta: act.data?.meta || null,
 			});
 
-			if (!up.ok) {
-				const t = await up.text().catch(() => "");
-				return json({ ok: false, error: "do_upsert_failed", details: t.slice(0, 300) }, 500);
+			// Upsert instance (si Lemon devolvió)
+			if (instanceId) {
+				await upsertLicenseInstance(dbi, {
+					instanceId,
+					licenseId: license.license_id,
+					tenantId,
+					deviceId,
+					instanceName: instanceName || null,
+				});
 			}
 
 			const token = await signToken(env, { tenantId, deviceId, licHash });
@@ -332,7 +377,7 @@ export default {
 
 		// 3) STATUS
 		if (url.pathname === "/v1/license/status" && request.method === "GET") {
-			const miss = assertEnv(env, ["LICENSE_JWT_SECRET"]);
+			const miss = assertEnv(env, ["LICENSE_JWT_SECRET", "TURSO_DATABASE_URL", "TURSO_AUTH_TOKEN"]);
 			if (miss) return json({ ok: false, error: miss }, 500);
 
 			const h = request.headers.get("authorization") || "";
@@ -346,17 +391,35 @@ export default {
 				return json({ ok: false, error: "invalid_token" }, 401);
 			}
 
-			const stub = getLicenseStub(env, claims.licHash);
-			const cur = await doFetch(stub, "/internal/get", { method: "GET" });
-			if (!cur.ok) return json({ ok: false, error: "not_found" }, 404);
+			const dbi = get();
+			const lic = await getLicenseByHash(dbi, claims.licHash);
+			if (!lic) return json({ ok: false, error: "not_found" }, 404);
 
-			const j = await cur.json<any>();
-			return json({ ok: true, state: j.row, serverTime: Date.now() });
+			// Opcional: aquí podrías comprobar si el device está revocado (devices.revoked_at_ms)
+			return json({
+				ok: true,
+				state: {
+					tenant_id: lic.tenant_id,
+					status: lic.status,
+					expires_at: lic.expires_at,
+					disabled: lic.disabled,
+					test_mode: lic.test_mode,
+					key_short: lic.key_short,
+					updated_at_ms: lic.updated_at_ms,
+					created_at_ms: lic.created_at_ms,
+				},
+				serverTime: Date.now(),
+			});
 		}
 
 		// 4) VALIDATE (re-check con Lemon)
 		if (url.pathname === "/v1/license/validate" && request.method === "POST") {
-			const miss = assertEnv(env, ["LICENSE_JWT_SECRET", "LICENSE_STORE_KEY"]);
+			const miss = assertEnv(env, [
+				"LICENSE_JWT_SECRET",
+				"LICENSE_STORE_KEY",
+				"TURSO_DATABASE_URL",
+				"TURSO_AUTH_TOKEN",
+			]);
 			if (miss) return json({ ok: false, error: miss }, 500);
 
 			const h = request.headers.get("authorization") || "";
@@ -370,39 +433,39 @@ export default {
 				return json({ ok: false, error: "invalid_token" }, 401);
 			}
 
-			const stub = getLicenseStub(env, claims.licHash);
+			const dbi = get();
+			await ensureExtraSchema(dbi);
 
-			const dec = await doFetch(stub, "/internal/get-decrypted", { method: "GET" });
-			if (!dec.ok) return json({ ok: false, error: "not_found" }, 404);
-			const dj = await dec.json<any>();
+			const dec = await getDecryptedLicenseKey(dbi, env.LICENSE_STORE_KEY, claims.licHash);
+			if (!dec) return json({ ok: false, error: "not_found" }, 404);
 
-			const licenseKey = String(dj?.row?.licenseKey || "");
-			const instanceId = dj?.row?.instance_id ? String(dj.row.instance_id) : null;
+			const licenseKey = dec.licenseKey;
 
-			const val = await lemonValidate(licenseKey, instanceId);
-			if (!val.ok) return json({ ok: false, error: "lemon_validate_failed", details: val.data || val.text }, 400);
+			// si tienes un instance_id por device, podrías buscarlo en license_instances,
+			// pero para simplificar usamos el validate “sin instance” o puedes extenderlo.
+			const val = await lemonValidate(licenseKey, null);
+
+			if (!val.ok) {
+				return json({ ok: false, error: "lemon_validate_failed", details: val.data || val.text }, 400);
+			}
 
 			const status = (val.data?.license_key?.status || "active") as LicenseStatus;
 			const expiresAt = val.data?.license_key?.expires_at ? String(val.data.license_key.expires_at) : null;
 
-			const up = await doFetch(stub, "/internal/upsert", {
-				method: "POST",
-				headers: { "content-type": "application/json" },
-				body: JSON.stringify({
-					tenantId: dj.row.tenant_id,
-					deviceId: dj.row.device_id,
-					instanceId,
-					status,
-					expiresAt,
-					licenseKey,
-					meta: val.data?.meta || null,
-				}),
+			// actualiza licencia con lo último
+			await upsertLicenseFromEventOrActivation({
+				db: dbi,
+				storeKeyB64: env.LICENSE_STORE_KEY,
+				licenseKeyPlain: licenseKey,
+				tenantId: dec.lic.tenant_id,
+				status,
+				expiresAt,
+				testMode: Boolean(val.data?.meta?.test_mode),
+				instances_count: typeof val.data?.license_key?.instances_count === "number" ? val.data.license_key.instances_count : null,
+				activation_limit: typeof val.data?.license_key?.activation_limit === "number" ? val.data.license_key.activation_limit : null,
+				lemon_updated_at: val.data?.license_key?.updated_at ? String(val.data.license_key.updated_at) : null,
+				meta: val.data?.meta || null,
 			});
-
-			if (!up.ok) {
-				const t = await up.text().catch(() => "");
-				return json({ ok: false, error: "do_upsert_failed", details: t.slice(0, 300) }, 500);
-			}
 
 			return json({ ok: true, status, expiresAt, valid: val.data?.valid, meta: val.data?.meta });
 		}
