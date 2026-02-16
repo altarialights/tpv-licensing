@@ -25,10 +25,9 @@ import { sha256Hex } from "./crypto";
 // ---------------- Env ----------------
 
 export interface Env extends TursoEnv {
-	// Secrets
-	LEMON_WEBHOOK_SECRET: string; // Signing secret del webhook
-	LICENSE_JWT_SECRET: string;   // para firmar JWT
-	LICENSE_STORE_KEY: string;    // base64 32 bytes (AES-GCM)
+	LEMON_WEBHOOK_SECRET: string;
+	LICENSE_JWT_SECRET: string;
+	LICENSE_STORE_KEY: string; // base64 32 bytes (AES-GCM)
 }
 
 // ---------------- Helpers ----------------
@@ -194,7 +193,6 @@ export default {
 			const validSig = await verifyLemonSignature(request, env.LEMON_WEBHOOK_SECRET, raw);
 			if (!validSig) return json({ ok: false, error: "invalid_signature" }, 401);
 
-			// idempotencia: event_uid = sha256(sig + body)
 			const sig = (request.headers.get("X-Signature") || "").trim().toLowerCase();
 			const bodySha = await sha256Hex(raw);
 			const eventUid = await sha256Hex(sig + ":" + bodySha);
@@ -242,7 +240,7 @@ export default {
 						db: dbi,
 						storeKeyB64: env.LICENSE_STORE_KEY,
 						licenseKeyPlain: licenseKey,
-						tenantId: null, // todavía puede estar sin asignar hasta activar
+						tenantId: null,
 						status: (status || "active") as LicenseStatus,
 						expiresAt,
 						testMode,
@@ -251,7 +249,6 @@ export default {
 						lemon_created_at: (attrs as any).created_at ? String((attrs as any).created_at) : null,
 						lemon_updated_at: (attrs as any).updated_at ? String((attrs as any).updated_at) : null,
 
-						// guardamos payload completo como meta (igual que antes)
 						meta: { eventName, payload },
 					});
 				}
@@ -279,16 +276,23 @@ export default {
 
 			const body = await readJsonSafe<ActivateRequest>(request, {
 				activationKey: "",
-				deviceId: "",
-				instanceName: undefined,
+				deviceId: "",          // puede venir vacío
+				instanceName: undefined // puede venir undefined
 			} as any);
 
-			const activationKey = String(body.activationKey || "").trim();
-			const deviceId = String(body.deviceId || "").trim();
-			const instanceName = String(body.instanceName || `tpv-${deviceId.slice(0, 12)}`).trim();
+			const activationKey = String((body as any).activationKey || "").trim();
 
-			if (!activationKey || !deviceId) {
-				const out: ApiError = { ok: false, error: "activationKey and deviceId required" };
+			// ✅ deviceId: si viene (porque ya fue generado por el Worker en el pasado), lo respetamos.
+			// ✅ si NO viene, lo generamos aquí (Worker es la fuente de verdad).
+			const reqDeviceId = String((body as any).deviceId || "").trim();
+			const deviceId = reqDeviceId || crypto.randomUUID();
+
+			// ✅ instanceName: si no viene, lo generamos a partir del deviceId server-side
+			const reqInstanceName = String((body as any).instanceName || "").trim();
+			const instanceName = reqInstanceName || `tpv-${deviceId.slice(0, 12)}`;
+
+			if (!activationKey) {
+				const out: ApiError = { ok: false, error: "activationKey required" };
 				return json(out, 400);
 			}
 
@@ -312,17 +316,18 @@ export default {
 			const dbi = get();
 			await ensureExtraSchema(dbi);
 
-			// Si ya existe por webhook, reutilizamos tenant_id si ya estaba asignado
 			const licHash = await sha256Hex(activationKey);
 			const existing = await getLicenseByHash(dbi, licHash);
 
-			let tenantId = existing?.tenant_id && existing.tenant_id !== "PENDING" ? existing.tenant_id : crypto.randomUUID();
+			let tenantId =
+				existing?.tenant_id && existing.tenant_id !== "PENDING"
+					? existing.tenant_id
+					: crypto.randomUUID();
 
-			// Garantiza tenant y device
+			// Garantiza tenant y device (deviceId ya es el “server-generated” o uno previo server-generated)
 			await ensureTenantExistsMinimal(dbi, tenantId);
 			await ensureDevice(dbi, tenantId, deviceId, "tpv");
 
-			// Upsert licencia (y guardamos meta de activate)
 			const { license } = await upsertLicenseFromEventOrActivation({
 				db: dbi,
 				storeKeyB64: env.LICENSE_STORE_KEY,
@@ -351,7 +356,6 @@ export default {
 				meta: act.data?.meta || null,
 			});
 
-			// Upsert instance (si Lemon devolvió)
 			if (instanceId) {
 				await upsertLicenseInstance(dbi, {
 					instanceId,
@@ -364,9 +368,11 @@ export default {
 
 			const token = await signToken(env, { tenantId, deviceId, licHash });
 
-			const out: ActivateResponse = {
+			// ✅ incluimos deviceId para que la TPV lo guarde (y nunca lo genere)
+			const out: ActivateResponse & { deviceId: string } = {
 				ok: true,
 				tenantId,
+				deviceId,
 				token,
 				status,
 				expiresAt,
@@ -395,7 +401,6 @@ export default {
 			const lic = await getLicenseByHash(dbi, claims.licHash);
 			if (!lic) return json({ ok: false, error: "not_found" }, 404);
 
-			// Opcional: aquí podrías comprobar si el device está revocado (devices.revoked_at_ms)
 			return json({
 				ok: true,
 				state: {
@@ -441,10 +446,7 @@ export default {
 
 			const licenseKey = dec.licenseKey;
 
-			// si tienes un instance_id por device, podrías buscarlo en license_instances,
-			// pero para simplificar usamos el validate “sin instance” o puedes extenderlo.
 			const val = await lemonValidate(licenseKey, null);
-
 			if (!val.ok) {
 				return json({ ok: false, error: "lemon_validate_failed", details: val.data || val.text }, 400);
 			}
@@ -452,7 +454,6 @@ export default {
 			const status = (val.data?.license_key?.status || "active") as LicenseStatus;
 			const expiresAt = val.data?.license_key?.expires_at ? String(val.data.license_key.expires_at) : null;
 
-			// actualiza licencia con lo último
 			await upsertLicenseFromEventOrActivation({
 				db: dbi,
 				storeKeyB64: env.LICENSE_STORE_KEY,
