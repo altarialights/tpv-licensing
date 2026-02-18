@@ -118,6 +118,18 @@ async function verifyLemonSignature(req: Request, secret: string, rawBody: strin
 	return timingSafeEqualHex(hex, sig);
 }
 
+/** ✅ FIX: Turso suele devolver 0/1; Rust espera boolean en status */
+function toBool01(v: any, fallback = false): boolean {
+	if (typeof v === "boolean") return v;
+	if (typeof v === "number") return v !== 0;
+	if (typeof v === "string") {
+		const s = v.trim().toLowerCase();
+		if (s === "true" || s === "1") return true;
+		if (s === "false" || s === "0") return false;
+	}
+	return fallback;
+}
+
 // ---------------- Lemon License API ----------------
 
 async function lemonActivate(licenseKey: string, instanceName: string) {
@@ -136,7 +148,9 @@ async function lemonActivate(licenseKey: string, instanceName: string) {
 
 	const text = await r.text();
 	let data: any = null;
-	try { data = JSON.parse(text); } catch { }
+	try {
+		data = JSON.parse(text);
+	} catch { }
 	return { ok: r.ok, status: r.status, data, text };
 }
 
@@ -156,7 +170,9 @@ async function lemonValidate(licenseKey: string, instanceId?: string | null) {
 
 	const text = await r.text();
 	let data: any = null;
-	try { data = JSON.parse(text); } catch { }
+	try {
+		data = JSON.parse(text);
+	} catch { }
 	return { ok: r.ok, status: r.status, data, text };
 }
 
@@ -274,20 +290,22 @@ export default {
 			const err = requireJson(request);
 			if (err) return err;
 
-			const body = await readJsonSafe<ActivateRequest>(request, {
-				activationKey: "",
-				deviceId: "",          // puede venir vacío
-				instanceName: undefined // puede venir undefined
-			} as any);
+			const body = await readJsonSafe<ActivateRequest>(
+				request,
+				{
+					activationKey: "",
+					deviceId: "", // puede venir vacío
+					instanceName: undefined, // puede venir undefined
+				} as any
+			);
 
 			const activationKey = String((body as any).activationKey || "").trim();
 
-			// ✅ deviceId: si viene (porque ya fue generado por el Worker en el pasado), lo respetamos.
-			// ✅ si NO viene, lo generamos aquí (Worker es la fuente de verdad).
+			// ✅ deviceId: si viene, lo respetamos; si no, lo genera el Worker
 			const reqDeviceId = String((body as any).deviceId || "").trim();
 			const deviceId = reqDeviceId || crypto.randomUUID();
 
-			// ✅ instanceName: si no viene, lo generamos a partir del deviceId server-side
+			// ✅ instanceName: si no viene, lo generamos a partir del deviceId
 			const reqInstanceName = String((body as any).instanceName || "").trim();
 			const instanceName = reqInstanceName || `tpv-${deviceId.slice(0, 12)}`;
 
@@ -324,7 +342,7 @@ export default {
 					? existing.tenant_id
 					: crypto.randomUUID();
 
-			// Garantiza tenant y device (deviceId ya es el “server-generated” o uno previo server-generated)
+			// Garantiza tenant y device
 			await ensureTenantExistsMinimal(dbi, tenantId);
 			await ensureDevice(dbi, tenantId, deviceId, "tpv");
 
@@ -398,6 +416,9 @@ export default {
 			}
 
 			const dbi = get();
+			// (seguro) si llamas a status en un despliegue “fresh”
+			await ensureExtraSchema(dbi);
+
 			const lic = await getLicenseByHash(dbi, claims.licHash);
 			if (!lic) return json({ ok: false, error: "not_found" }, 404);
 
@@ -407,8 +428,9 @@ export default {
 					tenant_id: lic.tenant_id,
 					status: lic.status,
 					expires_at: lic.expires_at,
-					disabled: lic.disabled,
-					test_mode: lic.test_mode,
+					// ✅ FIX: fuerza boolean (evita invalid_json en Rust)
+					disabled: toBool01((lic as any).disabled, false),
+					test_mode: toBool01((lic as any).test_mode, false),
 					key_short: lic.key_short,
 					updated_at_ms: lic.updated_at_ms,
 					created_at_ms: lic.created_at_ms,
@@ -462,8 +484,14 @@ export default {
 				status,
 				expiresAt,
 				testMode: Boolean(val.data?.meta?.test_mode),
-				instances_count: typeof val.data?.license_key?.instances_count === "number" ? val.data.license_key.instances_count : null,
-				activation_limit: typeof val.data?.license_key?.activation_limit === "number" ? val.data.license_key.activation_limit : null,
+				instances_count:
+					typeof val.data?.license_key?.instances_count === "number"
+						? val.data.license_key.instances_count
+						: null,
+				activation_limit:
+					typeof val.data?.license_key?.activation_limit === "number"
+						? val.data.license_key.activation_limit
+						: null,
 				lemon_updated_at: val.data?.license_key?.updated_at ? String(val.data.license_key.updated_at) : null,
 				meta: val.data?.meta || null,
 			});
