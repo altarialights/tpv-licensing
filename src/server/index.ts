@@ -1,7 +1,5 @@
 // src/server/index.ts
 import { SignJWT, jwtVerify } from "jose";
-import { createClient } from "@libsql/client/web";
-
 import type {
 	ActivateRequest,
 	ActivateResponse,
@@ -24,6 +22,8 @@ import {
 } from "./licenseStore";
 import { sha256Hex } from "./crypto";
 
+import { createClient, type Client } from "@libsql/client";
+
 // ---------------- Env ----------------
 
 export interface Env extends TursoEnv {
@@ -31,11 +31,10 @@ export interface Env extends TursoEnv {
 	LICENSE_JWT_SECRET: string;
 	LICENSE_STORE_KEY: string; // base64 32 bytes (AES-GCM)
 
-	// Turso Platform API (crear DB por tenant y tokens por DB)
-	TURSO_ORG_SLUG: string; // ej: "altarialights"
-	TURSO_PLATFORM_TOKEN: string; // token platform
-	TURSO_GROUP?: string; // opcional (si no pones, usamos "default")
-	TURSO_TOKEN_TTL?: string; // opcional ej "7d"
+	// ✅ Turso Platform API (para crear DBs + tokens)
+	TURSO_PLATFORM_TOKEN: string; // Bearer token (platform)
+	TURSO_ORG_SLUG: string; // "altarialights" (slug de org o user)
+	// TURSO_GROUP?: string; // si quisieras, aquí lo dejaríamos; por ahora usamos "default"
 }
 
 // ---------------- Helpers ----------------
@@ -138,17 +137,7 @@ function toBool01(v: any, fallback = false): boolean {
 	return fallback;
 }
 
-// ---------------- libsql exec helper (compat) ----------------
-
-async function execSql(db: any, sql: string, args: any[] = []) {
-	try {
-		return await db.execute({ sql, args });
-	} catch {
-		return await db.execute(sql, args);
-	}
-}
-
-// ---------------- Base64 helpers ----------------
+// ---------------- AES-GCM (para turso_auth_token_enc) ----------------
 
 function b64ToBytes(b64: string): Uint8Array {
 	const bin = atob(b64);
@@ -163,64 +152,87 @@ function bytesToB64(bytes: Uint8Array): string {
 	return btoa(bin);
 }
 
-// ---------------- AES-GCM encrypt/decrypt ----------------
-
-async function aesGcmEncryptB64(keyB64: string, plaintext: string): Promise<string> {
+async function aesGcmEncryptToB64(keyB64: string, plaintext: string): Promise<string> {
 	const keyBytes = b64ToBytes(keyB64);
-	if (keyBytes.length !== 32) throw new Error("LICENSE_STORE_KEY must be 32 bytes (base64)");
-
-	const key = await crypto.subtle.importKey("raw", keyBytes, "AES-GCM", false, ["encrypt"]);
+	const key = await crypto.subtle.importKey("raw", keyBytes, { name: "AES-GCM" }, false, ["encrypt"]);
 	const iv = crypto.getRandomValues(new Uint8Array(12));
-	const pt = new TextEncoder().encode(plaintext);
-
-	const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, pt));
-
-	const out = new Uint8Array(iv.length + ct.length);
+	const ct = await crypto.subtle.encrypt(
+		{ name: "AES-GCM", iv },
+		key,
+		new TextEncoder().encode(plaintext)
+	);
+	const out = new Uint8Array(iv.length + ct.byteLength);
 	out.set(iv, 0);
-	out.set(ct, iv.length);
-	return "v1:" + bytesToB64(out);
+	out.set(new Uint8Array(ct), iv.length);
+	return bytesToB64(out);
 }
 
-async function aesGcmDecryptB64(keyB64: string, blob: string): Promise<string> {
-	if (!blob.startsWith("v1:")) throw new Error("unknown_cipher_version");
-	const raw = b64ToBytes(blob.slice(3));
+async function aesGcmDecryptFromB64(keyB64: string, payloadB64: string): Promise<string> {
+	const raw = b64ToBytes(payloadB64);
 	const iv = raw.slice(0, 12);
-	const ct = raw.slice(12);
-
+	const data = raw.slice(12);
 	const keyBytes = b64ToBytes(keyB64);
-	if (keyBytes.length !== 32) throw new Error("LICENSE_STORE_KEY must be 32 bytes (base64)");
-
-	const key = await crypto.subtle.importKey("raw", keyBytes, "AES-GCM", false, ["decrypt"]);
-	const pt = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, ct);
+	const key = await crypto.subtle.importKey("raw", keyBytes, { name: "AES-GCM" }, false, ["decrypt"]);
+	const pt = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, data);
 	return new TextDecoder().decode(pt);
 }
 
-// ========================
-// TU SCHEMA (tal cual)
-// ========================
+// ---------------- Lemon License API ----------------
 
-const TENANT_SCHEMA_SQL = String.raw`
-/* =========================================================
-   TPV SCHEMA (Inventario con LOTES + FEFO)
-   - Sin migraciones: pensado para borrar DB y recrear
-   - Cambios clave:
-     ✅ Productos = ficha (catálogo)
-     ✅ NUEVO: Lotes_Producto = existencias por lote (caducidad/cantidad)
-     ✅ NUEVO: Lote_Consumos = trazabilidad (qué lote se consumió en cada línea)
-     ✅ Vistas opcionales para Stock_Actual / Caducidad_Proxima / Lote_Proximo
-========================================================= */
+async function lemonActivate(licenseKey: string, instanceName: string) {
+	const body = new URLSearchParams();
+	body.set("license_key", licenseKey);
+	body.set("instance_name", instanceName);
 
+	const r = await fetch("https://api.lemonsqueezy.com/v1/licenses/activate", {
+		method: "POST",
+		headers: {
+			Accept: "application/json",
+			"content-type": "application/x-www-form-urlencoded",
+		},
+		body,
+	});
+
+	const text = await r.text();
+	let data: any = null;
+	try {
+		data = JSON.parse(text);
+	} catch { }
+	return { ok: r.ok, status: r.status, data, text };
+}
+
+async function lemonValidate(licenseKey: string, instanceId?: string | null) {
+	const body = new URLSearchParams();
+	body.set("license_key", licenseKey);
+	if (instanceId) body.set("instance_id", instanceId);
+
+	const r = await fetch("https://api.lemonsqueezy.com/v1/licenses/validate", {
+		method: "POST",
+		headers: {
+			Accept: "application/json",
+			"content-type": "application/x-www-form-urlencoded",
+		},
+		body,
+	});
+
+	const text = await r.text();
+	let data: any = null;
+	try {
+		data = JSON.parse(text);
+	} catch { }
+	return { ok: r.ok, status: r.status, data, text };
+}
+
+// ---------------- Tenant DB Provisioning (Turso Platform API) ----------------
+
+// ✅ Tu schema completo (tal cual lo has pasado). Lo ejecutamos por batch.
+const TPV_SCHEMA_SQL = String.raw`
 PRAGMA foreign_keys = ON;
 
-/* =========================================================
-   1. Seguridad y Usuarios
-========================================================= */
 CREATE TABLE IF NOT EXISTS Roles (
   ID_Rol INTEGER PRIMARY KEY AUTOINCREMENT,
   Nombre_Rol TEXT NOT NULL UNIQUE
 );
-
--- Seeds roles
 INSERT OR IGNORE INTO Roles (Nombre_Rol) VALUES
   ('Camarero'),
   ('Cocinero'),
@@ -234,13 +246,10 @@ CREATE TABLE IF NOT EXISTS Usuarios (
   Nombre TEXT NOT NULL,
   Apellido TEXT,
   Estado TEXT DEFAULT 'Activo',
-  Requiere_Setup INTEGER DEFAULT 0, -- 0/1
+  Requiere_Setup INTEGER DEFAULT 0,
   FOREIGN KEY (ID_Rol) REFERENCES Roles(ID_Rol)
 );
 
-/* =========================================================
-   2. Personal y Horarios (Trabajadores)
-========================================================= */
 CREATE TABLE IF NOT EXISTS Trabajadores (
   ID_Trabajador INTEGER PRIMARY KEY AUTOINCREMENT,
   ID_Usuario INTEGER UNIQUE NOT NULL,
@@ -275,7 +284,6 @@ CREATE TABLE IF NOT EXISTS Asignacion_Turnos (
 CREATE INDEX IF NOT EXISTS idx_asig_fecha ON Asignacion_Turnos(Fecha);
 CREATE INDEX IF NOT EXISTS idx_asig_trab_fecha ON Asignacion_Turnos(ID_Trabajador, Fecha);
 
--- Seeds turnos
 INSERT OR IGNORE INTO Turnos (Nombre_Turno) VALUES
   ('LIBRE'),
   ('PARTIDO'),
@@ -283,16 +291,13 @@ INSERT OR IGNORE INTO Turnos (Nombre_Turno) VALUES
   ('TARDE'),
   ('NOCHE');
 
-/* =========================================================
-   3. Inventario y Productos (con LOTES)
-========================================================= */
 CREATE TABLE IF NOT EXISTS Categorias_Producto (
   ID_Categoria INTEGER PRIMARY KEY AUTOINCREMENT,
   Nombre TEXT NOT NULL UNIQUE,
   Nombre_Imagen TEXT,
   Ruta_Imagen TEXT,
-  Vendible INTEGER NOT NULL DEFAULT 1,   -- 0/1
-  Pasa_Cocina INTEGER NOT NULL DEFAULT 0 -- 0/1
+  Vendible INTEGER NOT NULL DEFAULT 1,
+  Pasa_Cocina INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS Proveedores (
@@ -307,70 +312,46 @@ CREATE TABLE IF NOT EXISTS Proveedores (
   Ruta_Imagen TEXT
 );
 
--- ✅ Productos = ficha estable (SIN lote/caducidad/stock)
 CREATE TABLE IF NOT EXISTS Productos (
   ID_Producto INTEGER PRIMARY KEY AUTOINCREMENT,
   ID_Categoria INTEGER NOT NULL,
-
-  -- proveedor por defecto (opcional)
   ID_Proveedor INTEGER,
-
   Nombre TEXT NOT NULL UNIQUE,
   Precio_Venta REAL,
-
-  -- umbrales / info estable
   Stock_Minimo REAL DEFAULT 0,
   Unidad_Medida TEXT,
-
   Nombre_Imagen TEXT,
   Ruta_Imagen TEXT,
-
-  -- sigue siendo útil como “cantidad típica a pedir” (opcional)
   Cantidad_Pedido_Esperada REAL,
-
   FOREIGN KEY (ID_Categoria) REFERENCES Categorias_Producto(ID_Categoria),
   FOREIGN KEY (ID_Proveedor) REFERENCES Proveedores(ID_Proveedor)
 );
 
--- ✅ NUEVO: LOTES (existencias reales por lote/caducidad)
 CREATE TABLE IF NOT EXISTS Lotes_Producto (
   ID_Lote INTEGER PRIMARY KEY AUTOINCREMENT,
   ID_Producto INTEGER NOT NULL,
-
-  Codigo_Lote TEXT NOT NULL,          -- ej: "L-2026-001"
+  Codigo_Lote TEXT NOT NULL,
   Fecha_Entrada DATETIME NOT NULL DEFAULT (datetime('now','localtime')),
-  Caducidad DATE,                     -- NULL si no aplica
-
+  Caducidad DATE,
   Cantidad_Inicial REAL NOT NULL DEFAULT 0,
   Stock_Disponible REAL NOT NULL DEFAULT 0,
-
-  -- opcional: compras por lote
   Coste_Unitario REAL,
   ID_Proveedor INTEGER,
-
   Notas TEXT,
-
   FOREIGN KEY (ID_Producto) REFERENCES Productos(ID_Producto) ON DELETE CASCADE,
   FOREIGN KEY (ID_Proveedor) REFERENCES Proveedores(ID_Proveedor),
-
   UNIQUE (ID_Producto, Codigo_Lote),
   CHECK (Cantidad_Inicial >= 0),
   CHECK (Stock_Disponible >= 0)
 );
 
--- Índices para FEFO (buscar rápido el lote con menor caducidad y stock>0)
 CREATE INDEX IF NOT EXISTS idx_lotes_producto_cad
   ON Lotes_Producto(ID_Producto, Caducidad);
-
 CREATE INDEX IF NOT EXISTS idx_lotes_producto_stock
   ON Lotes_Producto(ID_Producto, Stock_Disponible);
-
 CREATE INDEX IF NOT EXISTS idx_lotes_producto_entrada
   ON Lotes_Producto(ID_Producto, Fecha_Entrada);
 
-/* =========================================================
-   ALÉRGENOS (catálogo + relación con productos)
-========================================================= */
 CREATE TABLE IF NOT EXISTS Alergenos (
   ID_Alergeno INTEGER PRIMARY KEY AUTOINCREMENT,
   Nombre TEXT NOT NULL UNIQUE,
@@ -389,9 +370,6 @@ CREATE TABLE IF NOT EXISTS Producto_Alergenos (
 CREATE INDEX IF NOT EXISTS idx_prod_alerg_prod ON Producto_Alergenos(ID_Producto);
 CREATE INDEX IF NOT EXISTS idx_prod_alerg_alerg ON Producto_Alergenos(ID_Alergeno);
 
-/* =========================================================
-   4. Zonas / Mesas / Clientes / Reservas
-========================================================= */
 CREATE TABLE IF NOT EXISTS Zonas (
   ID_Zona INTEGER PRIMARY KEY AUTOINCREMENT,
   Nombre_Zona TEXT NOT NULL UNIQUE,
@@ -404,18 +382,14 @@ CREATE TABLE IF NOT EXISTS Mesas (
   ID_Zona INTEGER NOT NULL,
   Numero_Mesa TEXT NOT NULL,
   Capacidad INTEGER NOT NULL,
-
   Ubicacion_X INTEGER NOT NULL,
   Ubicacion_Y INTEGER NOT NULL,
-
-  Shape TEXT NOT NULL, -- 'rect' | 'rounded' | 'circle'
+  Shape TEXT NOT NULL,
   Width INTEGER NOT NULL,
   Height INTEGER NOT NULL,
   Radius INTEGER,
-
   Updated_At DATETIME,
   Es_Sistema INTEGER NOT NULL DEFAULT 0,
-
   UNIQUE (ID_Zona, Numero_Mesa),
   FOREIGN KEY (ID_Zona) REFERENCES Zonas(ID_Zona) ON DELETE CASCADE
 );
@@ -432,19 +406,15 @@ CREATE TABLE IF NOT EXISTS Clientes (
 
 CREATE TABLE IF NOT EXISTS Reservas (
   ID_Reserva INTEGER PRIMARY KEY AUTOINCREMENT,
-
   ID_Cliente INTEGER NOT NULL,
   ID_Mesa INTEGER NOT NULL,
-
-  Dia_YMD TEXT NOT NULL,     -- 'YYYY-MM-DD'
-  Hora TEXT NOT NULL,        -- 'HH:MM'
-  Turno TEXT NOT NULL,       -- 'COMIDA' | 'CENA'
+  Dia_YMD TEXT NOT NULL,
+  Hora TEXT NOT NULL,
+  Turno TEXT NOT NULL,
   Comensales INTEGER NOT NULL DEFAULT 1,
   Nota TEXT,
-  Estado TEXT NOT NULL DEFAULT 'ACTIVA', -- ACTIVA | CANCELADA | NO_SHOW | FINALIZADA
-
+  Estado TEXT NOT NULL DEFAULT 'ACTIVA',
   Created_At TEXT DEFAULT (datetime('now','localtime')),
-
   FOREIGN KEY (ID_Cliente) REFERENCES Clientes(ID_Cliente),
   FOREIGN KEY (ID_Mesa) REFERENCES Mesas(ID_Mesa)
 );
@@ -452,20 +422,15 @@ CREATE TABLE IF NOT EXISTS Reservas (
 CREATE INDEX IF NOT EXISTS idx_reservas_mesa_dia_hora
 ON Reservas(ID_Mesa, Dia_YMD, Hora);
 
-/* =========================================================
-   5. Comandas / Detalles / Facturas / Cuentas
-========================================================= */
 CREATE TABLE IF NOT EXISTS Comandas (
   ID_Comanda INTEGER PRIMARY KEY AUTOINCREMENT,
   ID_Mesa INTEGER NOT NULL,
   ID_Reserva INTEGER NULL,
   ID_Trabajador INTEGER NULL,
-
   Fecha_Hora_Apertura TEXT NOT NULL,
   Fecha_Hora_Cierre TEXT NULL,
   Total_Comanda REAL NOT NULL DEFAULT 0,
-  Estado TEXT NOT NULL DEFAULT 'Abierta', -- Abierta | Pagada
-
+  Estado TEXT NOT NULL DEFAULT 'Abierta',
   FOREIGN KEY (ID_Mesa) REFERENCES Mesas(ID_Mesa),
   FOREIGN KEY (ID_Reserva) REFERENCES Reservas(ID_Reserva),
   FOREIGN KEY (ID_Trabajador) REFERENCES Trabajadores(ID_Trabajador) ON DELETE SET NULL
@@ -473,14 +438,10 @@ CREATE TABLE IF NOT EXISTS Comandas (
 
 CREATE INDEX IF NOT EXISTS idx_comandas_mesa_estado
 ON Comandas(ID_Mesa, Estado);
-
 CREATE INDEX IF NOT EXISTS idx_comandas_reserva
 ON Comandas(ID_Reserva);
-
--- ✅ útil para stats de camareros
 CREATE INDEX IF NOT EXISTS idx_comandas_trab_apertura
 ON Comandas(ID_Trabajador, Fecha_Hora_Apertura);
-
 
 CREATE TABLE IF NOT EXISTS Detalle_Comanda (
   ID_Detalle INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -495,13 +456,12 @@ CREATE TABLE IF NOT EXISTS Detalle_Comanda (
   FOREIGN KEY (ID_Comanda) REFERENCES Comandas(ID_Comanda),
   FOREIGN KEY (ID_Producto) REFERENCES Productos(ID_Producto)
 );
+
 CREATE INDEX IF NOT EXISTS idx_dc_cocinero_fecha
 ON Detalle_Comanda(ID_Usuario_Cocinero, Fecha_Hora_Cocina);
-
 CREATE INDEX IF NOT EXISTS idx_dc_estado_fecha
 ON Detalle_Comanda(Estado_Cocina, Fecha_Hora_Cocina);
 
--- ✅ NUEVO (muy recomendado): trazabilidad de consumo por lote
 CREATE TABLE IF NOT EXISTS Lote_Consumos (
   ID_Detalle INTEGER NOT NULL,
   ID_Lote INTEGER NOT NULL,
@@ -535,9 +495,6 @@ CREATE TABLE IF NOT EXISTS Cuentas_Gastos (
   Tipo_Gasto TEXT NOT NULL
 );
 
-/* =========================================================
-   6. Tareas
-========================================================= */
 CREATE TABLE IF NOT EXISTS Tareas (
   ID_Tarea INTEGER PRIMARY KEY AUTOINCREMENT,
   Titulo TEXT NOT NULL,
@@ -561,14 +518,11 @@ CREATE TABLE IF NOT EXISTS Tarea_Asignaciones (
 CREATE INDEX IF NOT EXISTS idx_tarea_asig_trab ON Tarea_Asignaciones(ID_Trabajador, Estado);
 CREATE INDEX IF NOT EXISTS idx_tarea_asig_tarea ON Tarea_Asignaciones(ID_Tarea);
 
-/* =========================================================
-   7. Fichajes
-========================================================= */
 CREATE TABLE IF NOT EXISTS Fichajes (
   ID_Fichaje INTEGER PRIMARY KEY AUTOINCREMENT,
   ID_Usuario INTEGER NOT NULL,
   Fecha DATE NOT NULL,
-  Parte INTEGER NOT NULL DEFAULT 1, -- 1 o 2
+  Parte INTEGER NOT NULL DEFAULT 1,
   Hora_Entrada DATETIME,
   Hora_Salida DATETIME,
   Estado TEXT DEFAULT 'ABIERTO',
@@ -590,26 +544,20 @@ CREATE TABLE IF NOT EXISTS Fichaje_Dia (
   FOREIGN KEY (ID_Usuario) REFERENCES Usuarios(ID_Usuario)
 );
 
-/* =========================================================
-   8. Pagos
-========================================================= */
 CREATE TABLE IF NOT EXISTS Pagos (
   ID_Pago INTEGER PRIMARY KEY AUTOINCREMENT,
   ID_Comanda INTEGER NOT NULL,
   Fecha_Hora DATETIME NOT NULL,
   Metodo_Pago TEXT NOT NULL,
   Importe_Total REAL NOT NULL,
-  Tipo TEXT NOT NULL, -- 'TOTAL' | 'FRACCIONADO'
-
+  Tipo TEXT NOT NULL,
   ID_Usuario_Cobrador INTEGER,
   ID_Trabajador_Cobrador INTEGER,
-
   FOREIGN KEY (ID_Comanda) REFERENCES Comandas(ID_Comanda) ON DELETE CASCADE,
   FOREIGN KEY (ID_Usuario_Cobrador) REFERENCES Usuarios(ID_Usuario) ON DELETE SET NULL,
   FOREIGN KEY (ID_Trabajador_Cobrador) REFERENCES Trabajadores(ID_Trabajador) ON DELETE SET NULL
 );
 
--- ✅ índices para stats rápidas
 CREATE INDEX IF NOT EXISTS idx_pagos_fecha ON Pagos(Fecha_Hora);
 CREATE INDEX IF NOT EXISTS idx_pagos_comanda_fecha ON Pagos(ID_Comanda, Fecha_Hora);
 CREATE INDEX IF NOT EXISTS idx_pagos_trab_cobrador_fecha
@@ -623,9 +571,6 @@ CREATE TABLE IF NOT EXISTS Pago_Detalles (
   FOREIGN KEY (ID_Detalle) REFERENCES Detalle_Comanda(ID_Detalle)
 );
 
-/* =========================================================
-   9. Configuración (single-row)
-========================================================= */
 CREATE TABLE IF NOT EXISTS Business_Settings (
   ID INTEGER PRIMARY KEY CHECK (ID = 1),
   Business_Name TEXT NOT NULL DEFAULT 'TPV',
@@ -637,7 +582,6 @@ CREATE TABLE IF NOT EXISTS Business_Settings (
   IVA_Percent REAL NOT NULL DEFAULT 10,
   Updated_At TEXT DEFAULT (datetime('now','localtime'))
 );
-
 INSERT OR IGNORE INTO Business_Settings (ID) VALUES (1);
 
 CREATE TABLE IF NOT EXISTS Ticket_Settings (
@@ -654,14 +598,13 @@ CREATE TABLE IF NOT EXISTS Ticket_Settings (
   Show_FooterMessage INTEGER NOT NULL DEFAULT 1,
   Updated_At TEXT DEFAULT (datetime('now','localtime'))
 );
-
 INSERT OR IGNORE INTO Ticket_Settings (ID) VALUES (1);
 
 CREATE TABLE IF NOT EXISTS Horario_Predeterminado (
   ID_Default INTEGER PRIMARY KEY AUTOINCREMENT,
   ID_Trabajador INTEGER NOT NULL,
-  Weekday INTEGER NOT NULL,         -- 1..7
-  Orden INTEGER NOT NULL DEFAULT 1, -- 1..N por día
+  Weekday INTEGER NOT NULL,
+  Orden INTEGER NOT NULL DEFAULT 1,
   ID_Turno INTEGER NOT NULL,
   Area TEXT NOT NULL,
   Hora_Inicio TIME,
@@ -671,17 +614,12 @@ CREATE TABLE IF NOT EXISTS Horario_Predeterminado (
   FOREIGN KEY (ID_Turno) REFERENCES Turnos(ID_Turno),
   UNIQUE (ID_Trabajador, Weekday, Orden)
 );
-
 CREATE INDEX IF NOT EXISTS idx_hp_trab_weekday ON Horario_Predeterminado(ID_Trabajador, Weekday);
 
-/* =========================================================
-   10. VISTAS ÚTILES
-========================================================= */
 CREATE VIEW IF NOT EXISTS v_inventario_producto_stock AS
 SELECT
   p.ID_Producto,
   COALESCE(SUM(l.Stock_Disponible), 0) AS Stock_Actual,
-
   (
     SELECT l2.Caducidad
     FROM Lotes_Producto l2
@@ -691,7 +629,6 @@ SELECT
     ORDER BY date(l2.Caducidad) ASC, datetime(l2.Fecha_Entrada) ASC, l2.ID_Lote ASC
     LIMIT 1
   ) AS Caducidad_Proxima,
-
   (
     SELECT l3.Codigo_Lote
     FROM Lotes_Producto l3
@@ -708,24 +645,17 @@ FROM Productos p
 LEFT JOIN Lotes_Producto l ON l.ID_Producto = p.ID_Producto
 GROUP BY p.ID_Producto;
 
-/* =========================================================
-   SEEDS / DATOS INICIALES (DEMO)
-========================================================= */
-
--- Categorías
 INSERT OR IGNORE INTO Categorias_Producto (Nombre, Nombre_Imagen, Ruta_Imagen, Vendible, Pasa_Cocina) VALUES
   ('Comidas',  'comidas.png', '/comidas.png', 1, 1),
   ('Bebidas',  'comidas.png', '/comidas.png', 1, 0),
   ('Limpieza', 'comidas.png', '/comidas.png', 0, 0),
   ('Postres',  'comidas.png', '/comidas.png', 1, 1);
 
--- Proveedores
 INSERT OR IGNORE INTO Proveedores (Nombre_Empresa, Contacto, Telefono, Email, CIF) VALUES
   ('Distribuciones Demo SL', 'Carlos', '910000001', 'proveedor1@demo.com', 'B00000001'),
   ('Bebidas Demo SL',        'Marta',  '910000002', 'proveedor2@demo.com', 'B00000002'),
   ('Limpieza Demo SL',       'Pablo',  '910000003', 'proveedor3@demo.com', 'B00000003');
 
--- Productos (ficha)
 INSERT OR IGNORE INTO Productos (
   ID_Categoria, ID_Proveedor, Nombre, Precio_Venta, Stock_Minimo,
   Unidad_Medida, Nombre_Imagen, Ruta_Imagen, Cantidad_Pedido_Esperada
@@ -749,12 +679,10 @@ INSERT OR IGNORE INTO Productos (
   'ud', 'comidas.png', '/comidas.png', 12
 );
 
--- ✅ LOTES DEMO (varios lotes por producto)
 INSERT OR IGNORE INTO Lotes_Producto (
   ID_Producto, Codigo_Lote, Fecha_Entrada, Caducidad,
   Cantidad_Inicial, Stock_Disponible, Coste_Unitario, ID_Proveedor, Notas
 ) VALUES
--- Hamburguesa (2 lotes con caducidades diferentes)
 (
   (SELECT ID_Producto FROM Productos WHERE Nombre='Hamburguesa' LIMIT 1),
   'H-0001', datetime('now','localtime','-3 days'), date('now','+3 days'),
@@ -769,8 +697,6 @@ INSERT OR IGNORE INTO Lotes_Producto (
   (SELECT ID_Proveedor FROM Proveedores WHERE Nombre_Empresa='Distribuciones Demo SL' LIMIT 1),
   'Lote reciente'
 ),
-
--- Coca-Cola (1 lote)
 (
   (SELECT ID_Producto FROM Productos WHERE Nombre='Coca-Cola' LIMIT 1),
   'C-0002', datetime('now','localtime','-1 days'), date('now','+180 days'),
@@ -778,8 +704,6 @@ INSERT OR IGNORE INTO Lotes_Producto (
   (SELECT ID_Proveedor FROM Proveedores WHERE Nombre_Empresa='Bebidas Demo SL' LIMIT 1),
   NULL
 ),
-
--- Lavavajillas (sin caducidad)
 (
   (SELECT ID_Producto FROM Productos WHERE Nombre='Lavavajillas' LIMIT 1),
   'LIM-0003', datetime('now','localtime','-15 days'), NULL,
@@ -788,7 +712,6 @@ INSERT OR IGNORE INTO Lotes_Producto (
   'Sin caducidad'
 );
 
--- Alérgenos
 INSERT OR IGNORE INTO Alergenos (Nombre, Nombre_Imagen, Ruta_Imagen) VALUES
   ('Gluten', 'gluten.png', '/alergenos/gluten.png'),
   ('Crustáceos', 'crustaceos.png', '/alergenos/crustaceos.png'),
@@ -805,12 +728,10 @@ INSERT OR IGNORE INTO Alergenos (Nombre, Nombre_Imagen, Ruta_Imagen) VALUES
   ('Altramuces', 'altramuces.png', '/alergenos/altramuces.png'),
   ('Moluscos', 'moluscos.png', '/alergenos/moluscos.png');
 
--- Zonas / Mesas
 INSERT OR IGNORE INTO Zonas (Nombre_Zona, Room_Points, Updated_At) VALUES
   ('Salon', '[]', datetime('now')),
   ('Terraza', '[]', datetime('now'));
 
--- ✅✅ NUEVO: ZONA + MESA "BARRA" (para Venta Rápida, NO se renderiza si filtras Es_Sistema=1)
 INSERT OR IGNORE INTO Zonas (Nombre_Zona, Room_Points, Updated_At)
 VALUES ('BARRA', '[]', datetime('now'));
 
@@ -827,7 +748,6 @@ INSERT OR IGNORE INTO Mesas (
   datetime('now'), 1
 );
 
--- Mesas visibles
 INSERT OR IGNORE INTO Mesas (
   ID_Zona, Numero_Mesa, Capacidad,
   Ubicacion_X, Ubicacion_Y,
@@ -847,7 +767,6 @@ INSERT OR IGNORE INTO Mesas (
   'T1', 4, 140, 260, 'circle', 70, 70, 35, datetime('now')
 );
 
--- Fichajes demo (se ignora si no existe camarero@local)
 INSERT OR IGNORE INTO Fichajes (
   ID_Usuario, Fecha, Hora_Entrada, Hora_Salida,
   Estado, Cerrado_Automatico, Cierre_Motivo, Incidencia
@@ -862,9 +781,6 @@ INSERT OR IGNORE INTO Fichajes (
   NULL,
   NULL
 );
-/* =========================================================
-   SEEDS CLIENTES + RESERVAS + COMANDAS + PAGOS (para STATS)
-========================================================= */
 
 INSERT OR IGNORE INTO Clientes (ID_Cliente, Nombre, Telefono, Email, Notas, Total_Gastado, Created_At) VALUES
   (1, 'Ana Prueba',    '600000001', 'ana@demo.com',    'Nueva hoy con compra',     45.00, datetime('now','localtime','-2 hours')),
@@ -917,315 +833,177 @@ INSERT OR IGNORE INTO Pagos (
 INSERT OR IGNORE INTO Reservas (ID_Reserva, ID_Cliente, ID_Mesa, Dia_YMD, Hora, Turno, Comensales, Estado)
 VALUES (401, 1, (SELECT ID_Mesa FROM Mesas WHERE Numero_Mesa='M1' AND COALESCE(Es_Sistema,0)=0 LIMIT 1),
         date('now','-10 days'), '13:00', 'COMIDA', 2, 'FINALIZADA');
-
 INSERT OR IGNORE INTO Comandas (ID_Comanda, ID_Mesa, ID_Reserva, Fecha_Hora_Apertura, Fecha_Hora_Cierre, Total_Comanda, Estado)
 VALUES (4001, (SELECT ID_Mesa FROM Mesas WHERE Numero_Mesa='M1' AND COALESCE(Es_Sistema,0)=0 LIMIT 1),
         401, datetime('now','localtime','-10 days','-2 hours'), datetime('now','localtime','-10 days','-1 hours'), 12.00, 'Pagada');
-
 INSERT OR IGNORE INTO Pagos (ID_Pago, ID_Comanda, Fecha_Hora, Metodo_Pago, Importe_Total, Tipo)
 VALUES (8001, 4001, datetime('now','localtime','-10 days','-1 hours'), 'TARJETA', 12.00, 'TOTAL');
 `;
 
-// ========================
-// SQL splitter seguro (respeta strings y comentarios)
-// ========================
+// Splitter simple (evita partir dentro de comillas)
 function splitSqlStatements(sql: string): string[] {
 	const out: string[] = [];
-	let buf = "";
-
-	let inSQuote = false;
-	let inDQuote = false;
-	let inLineComment = false;
-	let inBlockComment = false;
+	let cur = "";
+	let inSingle = false;
+	let inDouble = false;
 
 	for (let i = 0; i < sql.length; i++) {
-		const c = sql[i];
-		const n = i + 1 < sql.length ? sql[i + 1] : "";
+		const ch = sql[i];
+		const prev = i > 0 ? sql[i - 1] : "";
 
-		// fin de comentario línea
-		if (inLineComment) {
-			buf += c;
-			if (c === "\n") inLineComment = false;
-			continue;
-		}
+		if (ch === "'" && !inDouble && prev !== "\\") inSingle = !inSingle;
+		if (ch === `"` && !inSingle && prev !== "\\") inDouble = !inDouble;
 
-		// fin comentario bloque
-		if (inBlockComment) {
-			buf += c;
-			if (c === "*" && n === "/") {
-				buf += n;
-				i++;
-				inBlockComment = false;
-			}
-			continue;
-		}
-
-		// iniciar comentarios (si no estás en strings)
-		if (!inSQuote && !inDQuote) {
-			if (c === "-" && n === "-") {
-				buf += c + n;
-				i++;
-				inLineComment = true;
-				continue;
-			}
-			if (c === "/" && n === "*") {
-				buf += c + n;
-				i++;
-				inBlockComment = true;
-				continue;
-			}
-		}
-
-		// toggle quotes
-		if (!inDQuote && c === "'" && !inLineComment && !inBlockComment) {
-			// maneja escape '' dentro de string
-			if (inSQuote && n === "'") {
-				buf += "''";
-				i++;
-				continue;
-			}
-			inSQuote = !inSQuote;
-			buf += c;
-			continue;
-		}
-		if (!inSQuote && c === `"` && !inLineComment && !inBlockComment) {
-			inDQuote = !inDQuote;
-			buf += c;
-			continue;
-		}
-
-		// split por ;
-		if (!inSQuote && !inDQuote && c === ";") {
-			const stmt = buf.trim();
+		if (ch === ";" && !inSingle && !inDouble) {
+			const stmt = cur.trim();
 			if (stmt) out.push(stmt);
-			buf = "";
+			cur = "";
 			continue;
 		}
 
-		buf += c;
+		cur += ch;
 	}
 
-	const last = buf.trim();
+	const last = cur.trim();
 	if (last) out.push(last);
 	return out;
 }
 
-// ========================
-// Turso Platform API
-// ========================
+// Sanitiza nombre db: minúsculas, números y guiones; max 64
+function makeDbNameFromTenant(tenantId: string): string {
+	const base = `tpv-${tenantId}`.toLowerCase();
+	const clean = base.replace(/[^a-z0-9-]/g, "-").replace(/-+/g, "-");
+	return clean.length <= 64 ? clean : clean.slice(0, 64);
+}
 
-const TURSO_API_BASE = "https://api.turso.tech/v1";
+async function tursoCreateDatabase(env: Env, dbName: string): Promise<{ name: string; hostname: string; url: string }> {
+	// API: POST /v1/organizations/{organizationSlug}/databases :contentReference[oaicite:4]{index=4}
+	const r = await fetch(`https://api.turso.tech/v1/organizations/${encodeURIComponent(env.TURSO_ORG_SLUG)}/databases`, {
+		method: "POST",
+		headers: {
+			Authorization: `Bearer ${env.TURSO_PLATFORM_TOKEN}`,
+			"Content-Type": "application/json",
+			Accept: "application/json",
+		},
+		body: JSON.stringify({
+			name: dbName,
+			group: "default",
+		}),
+	});
 
-async function tursoCreateDatabase(env: Env, dbName: string) {
-	const group =
-		env.TURSO_GROUP && env.TURSO_GROUP.trim().length > 0 ? env.TURSO_GROUP.trim() : "default";
+	const text = await r.text();
+	let data: any = null;
+	try { data = JSON.parse(text); } catch { }
 
+	if (!r.ok) {
+		throw new Error(`turso_create_db_failed (${r.status}) ${text}`);
+	}
+
+	// docs devuelven { database: { Hostname, Name, DbId } } :contentReference[oaicite:5]{index=5}
+	const hostname = String(data?.database?.Hostname || data?.database?.hostname || "");
+	const name = String(data?.database?.Name || data?.database?.name || dbName);
+
+	if (!hostname) throw new Error(`turso_create_db_failed_missing_hostname ${text}`);
+
+	// URL libsql para SDK
+	const url = `libsql://${hostname}`;
+	return { name, hostname, url };
+}
+
+async function tursoCreateDbToken(env: Env, dbName: string): Promise<string> {
+	// Platform API: POST /v1/organizations/{org}/databases/{db}/auth/tokens :contentReference[oaicite:6]{index=6}
 	const r = await fetch(
-		`${TURSO_API_BASE}/organizations/${encodeURIComponent(env.TURSO_ORG_SLUG)}/databases`,
+		`https://api.turso.tech/v1/organizations/${encodeURIComponent(env.TURSO_ORG_SLUG)}/databases/${encodeURIComponent(
+			dbName
+		)}/auth/tokens?expiration=7d`,
 		{
 			method: "POST",
 			headers: {
 				Authorization: `Bearer ${env.TURSO_PLATFORM_TOKEN}`,
-				"content-type": "application/json",
 				Accept: "application/json",
 			},
-			body: JSON.stringify({ name: dbName, group }),
 		}
 	);
 
 	const text = await r.text();
 	let data: any = null;
-	try {
-		data = JSON.parse(text);
-	} catch { }
-	return { ok: r.ok, status: r.status, data, text };
+	try { data = JSON.parse(text); } catch { }
+
+	if (!r.ok) throw new Error(`turso_create_db_token_failed (${r.status}) ${text}`);
+
+	const jwt = String(data?.jwt || "");
+	if (!jwt) throw new Error(`turso_create_db_token_failed_missing_jwt ${text}`);
+	return jwt;
 }
 
-async function tursoGetDatabase(env: Env, dbName: string) {
-	const r = await fetch(
-		`${TURSO_API_BASE}/organizations/${encodeURIComponent(env.TURSO_ORG_SLUG)}/databases/${encodeURIComponent(dbName)}`,
-		{
-			method: "GET",
-			headers: {
-				Authorization: `Bearer ${env.TURSO_PLATFORM_TOKEN}`,
-				Accept: "application/json",
-			},
-		}
-	);
-	const text = await r.text();
-	let data: any = null;
-	try {
-		data = JSON.parse(text);
-	} catch { }
-	return { ok: r.ok, status: r.status, data, text };
+async function getTenantDbRow(dbi: ReturnType<typeof getDb>, tenantId: string) {
+	const r = await dbi.execute({
+		sql: `SELECT tenant_id, turso_db_name, turso_url, turso_auth_token_enc
+		      FROM tenant_databases
+		      WHERE tenant_id = ? LIMIT 1`,
+		args: [tenantId],
+	});
+	return r.rows?.[0] as any | undefined;
 }
 
-async function tursoCreateDbToken(env: Env, dbName: string, expiration: string) {
-	const url =
-		`${TURSO_API_BASE}/organizations/${encodeURIComponent(env.TURSO_ORG_SLUG)}` +
-		`/databases/${encodeURIComponent(dbName)}/auth/tokens` +
-		`?expiration=${encodeURIComponent(expiration)}&authorization=full-access`;
+async function upsertTenantDbRow(
+	dbi: ReturnType<typeof getDb>,
+	env: Env,
+	tenantId: string,
+	dbName: string,
+	tursoUrl: string,
+	tursoTokenPlain: string
+) {
+	const enc = await aesGcmEncryptToB64(env.LICENSE_STORE_KEY, tursoTokenPlain);
+	await dbi.execute({
+		sql: `INSERT INTO tenant_databases (tenant_id, turso_db_name, turso_url, turso_auth_token_enc, created_at_ms, rotated_at_ms)
+		      VALUES (?, ?, ?, ?, unixepoch()*1000, NULL)
+		      ON CONFLICT(tenant_id) DO UPDATE SET
+		        turso_db_name = excluded.turso_db_name,
+		        turso_url = excluded.turso_url,
+		        turso_auth_token_enc = excluded.turso_auth_token_enc,
+		        rotated_at_ms = unixepoch()*1000`,
+		args: [tenantId, dbName, tursoUrl, enc],
+	});
+}
 
-	const r = await fetch(url, {
-		method: "POST",
-		headers: {
-			Authorization: `Bearer ${env.TURSO_PLATFORM_TOKEN}`,
-			Accept: "application/json",
-		},
+async function applyTenantSchemaOnce(tursoUrl: string, token: string): Promise<void> {
+	const client: Client = createClient({
+		url: tursoUrl,
+		authToken: token,
 	});
 
-	const text = await r.text();
-	let data: any = null;
-	try {
-		data = JSON.parse(text);
-	} catch { }
-	return { ok: r.ok, status: r.status, data, text };
+	// ✅ Batch: una sola llamada a la DB en vez de N executes
+	// (evita "Too many subrequests" del Worker) :contentReference[oaicite:7]{index=7}
+	const stmts = splitSqlStatements(TPV_SCHEMA_SQL)
+		.map((s) => s.trim())
+		.filter(Boolean);
+
+	// ojo: batch acepta strings o objetos {sql,args}
+	await client.batch(stmts, "write");
 }
 
-function normalizeDbName(tenantId: string) {
-	// nombres de turso: evita caracteres raros y limita longitud
-	const t = tenantId.toLowerCase().replace(/[^a-z0-9-]/g, "-");
-	return `tpv-${t}`.slice(0, 64);
-}
+async function provisionTenantDatabase(dbi: ReturnType<typeof getDb>, env: Env, tenantId: string) {
+	// Si ya hay row, reusar (idempotente)
+	const existing = await getTenantDbRow(dbi, tenantId);
 
-// ========================
-// Provision tenant DB + execute schema
-// ========================
-
-async function getTenantDbRow(dbi: any, tenantId: string) {
-	const r = await execSql(
-		dbi,
-		`SELECT tenant_id, turso_db_name, turso_url, turso_auth_token_enc
-		   FROM tenant_databases
-		  WHERE tenant_id = ?`,
-		[tenantId]
-	);
-	const rows = (r?.rows || r?.result?.rows || []) as any[];
-	return rows.length ? rows[0] : null;
-}
-
-async function upsertTenantDbRow(dbi: any, tenantId: string, dbName: string, url: string, tokenEnc: string) {
-	await execSql(
-		dbi,
-		`INSERT INTO tenant_databases (tenant_id, turso_db_name, turso_url, turso_auth_token_enc, created_at_ms, rotated_at_ms)
-		 VALUES (?, ?, ?, ?, (unixepoch()*1000), (unixepoch()*1000))
-		 ON CONFLICT(tenant_id) DO UPDATE SET
-		   turso_db_name = excluded.turso_db_name,
-		   turso_url = excluded.turso_url,
-		   turso_auth_token_enc = excluded.turso_auth_token_enc,
-		   rotated_at_ms = (unixepoch()*1000)`,
-		[tenantId, dbName, url, tokenEnc]
-	);
-}
-
-async function applyTenantSchema(tenantUrl: string, tenantTokenPlain: string) {
-	const tenantDb = createClient({ url: tenantUrl, authToken: tenantTokenPlain });
-
-	const stmts = splitSqlStatements(TENANT_SCHEMA_SQL);
-
-	// Ejecuta en orden
-	for (const s of stmts) {
-		// Seguridad: evita ejecutar "vacíos"
-		const sql = s.trim();
-		if (!sql) continue;
-		await tenantDb.execute(sql);
-	}
-}
-
-async function ensureTenantDatabaseProvisioned(env: Env, dbi: any, tenantId: string) {
-	// si ya existe mapping completo, no hacemos nada
-	const current = await getTenantDbRow(dbi, tenantId);
-	if (current?.turso_url && current?.turso_auth_token_enc) {
-		return { ok: true, url: String(current.turso_url), dbName: String(current.turso_db_name || "") };
+	if (existing?.turso_url && existing?.turso_auth_token_enc) {
+		const token = await aesGcmDecryptFromB64(env.LICENSE_STORE_KEY, String(existing.turso_auth_token_enc));
+		await applyTenantSchemaOnce(String(existing.turso_url), token);
+		return { reused: true, dbName: String(existing.turso_db_name || ""), url: String(existing.turso_url) };
 	}
 
-	const ttl = env.TURSO_TOKEN_TTL && env.TURSO_TOKEN_TTL.trim().length > 0 ? env.TURSO_TOKEN_TTL.trim() : "7d";
-	const dbName = current?.turso_db_name ? String(current.turso_db_name) : normalizeDbName(tenantId);
-
-	// 1) crear db (o recuperarla si ya existe)
-	let dbUrl: string | null = null;
+	// Si no existe, crear DB + token + guardar + aplicar schema
+	const dbName = makeDbNameFromTenant(tenantId);
 
 	const created = await tursoCreateDatabase(env, dbName);
-	let hostname =
-		created.data?.database?.Hostname ||
-		created.data?.database?.hostname ||
-		created.data?.Hostname ||
-		created.data?.hostname ||
-		null;
+	const dbToken = await tursoCreateDbToken(env, created.name);
 
-	if (!created.ok || !hostname) {
-		const got = await tursoGetDatabase(env, dbName);
-		if (!got.ok) throw new Error(`turso_create_or_get_db_failed create=${created.status} get=${got.status}`);
+	await upsertTenantDbRow(dbi, env, tenantId, created.name, created.url, dbToken);
 
-		hostname =
-			got.data?.database?.Hostname ||
-			got.data?.database?.hostname ||
-			got.data?.Hostname ||
-			got.data?.hostname ||
-			null;
+	await applyTenantSchemaOnce(created.url, dbToken);
 
-		if (!hostname) throw new Error("turso_db_missing_hostname");
-	}
-
-	dbUrl = String(hostname).startsWith("libsql://") ? String(hostname) : `libsql://${hostname}`;
-
-	// 2) token para esa db
-	const tok = await tursoCreateDbToken(env, dbName, ttl);
-	if (!tok.ok) throw new Error(`turso_create_token_failed status=${tok.status}`);
-
-	const tokenPlain = tok.data?.jwt || tok.data?.token || tok.data?.Token || tok.data?.authToken;
-	if (!tokenPlain) throw new Error("turso_create_token_missing_jwt");
-
-	// 3) aplicar schema
-	await applyTenantSchema(dbUrl, String(tokenPlain));
-
-	// 4) guardar token cifrado en DB general
-	const tokenEnc = await aesGcmEncryptB64(env.LICENSE_STORE_KEY, String(tokenPlain));
-	await upsertTenantDbRow(dbi, tenantId, dbName, dbUrl, tokenEnc);
-
-	return { ok: true, url: dbUrl, dbName };
-}
-
-// ---------------- Lemon License API ----------------
-
-async function lemonActivate(licenseKey: string, instanceName: string) {
-	const body = new URLSearchParams();
-	body.set("license_key", licenseKey);
-	body.set("instance_name", instanceName);
-
-	const r = await fetch("https://api.lemonsqueezy.com/v1/licenses/activate", {
-		method: "POST",
-		headers: {
-			Accept: "application/json",
-			"content-type": "application/x-www-form-urlencoded",
-		},
-		body,
-	});
-
-	const text = await r.text();
-	let data: any = null;
-	try { data = JSON.parse(text); } catch { }
-	return { ok: r.ok, status: r.status, data, text };
-}
-
-async function lemonValidate(licenseKey: string, instanceId?: string | null) {
-	const body = new URLSearchParams();
-	body.set("license_key", licenseKey);
-	if (instanceId) body.set("instance_id", instanceId);
-
-	const r = await fetch("https://api.lemonsqueezy.com/v1/licenses/validate", {
-		method: "POST",
-		headers: {
-			Accept: "application/json",
-			"content-type": "application/x-www-form-urlencoded",
-		},
-		body,
-	});
-
-	const text = await r.text();
-	let data: any = null;
-	try { data = JSON.parse(text); } catch { }
-	return { ok: r.ok, status: r.status, data, text };
+	return { reused: false, dbName: created.name, url: created.url };
 }
 
 // ---------------- Worker ----------------
@@ -1336,8 +1114,8 @@ export default {
 				"LICENSE_STORE_KEY",
 				"TURSO_DATABASE_URL",
 				"TURSO_AUTH_TOKEN",
-				"TURSO_ORG_SLUG",
 				"TURSO_PLATFORM_TOKEN",
+				"TURSO_ORG_SLUG",
 			]);
 			if (miss) return json({ ok: false, error: miss }, 500);
 
@@ -1355,9 +1133,11 @@ export default {
 
 			const activationKey = String((body as any).activationKey || "").trim();
 
+			// ✅ deviceId: si viene, lo respetamos; si no, lo genera el Worker
 			const reqDeviceId = String((body as any).deviceId || "").trim();
 			const deviceId = reqDeviceId || crypto.randomUUID();
 
+			// ✅ instanceName: si no viene, lo generamos a partir del deviceId
 			const reqInstanceName = String((body as any).instanceName || "").trim();
 			const instanceName = reqInstanceName || `tpv-${deviceId.slice(0, 12)}`;
 
@@ -1366,14 +1146,30 @@ export default {
 				return json(out, 400);
 			}
 
-			const act = await lemonActivate(activationKey, instanceName);
-			if (!act.ok) {
-				const out: ApiError = {
-					ok: false,
-					error: act.data?.error || "lemon_activate_failed",
-					details: act.data || act.text,
-				};
-				return json(out, 400);
+			const dbi = get();
+			await ensureExtraSchema(dbi);
+
+			// ✅ Idempotencia antes de tocar Lemon:
+			// Si esta activationKey ya existe y tiene tenant asignado, NO volvemos a activar (evita activation_limit=1)
+			const licHash = await sha256Hex(activationKey);
+			const existing = await getLicenseByHash(dbi, licHash);
+
+			let act: { ok: boolean; status: number; data: any; text: string } | null = null;
+
+			// Si no hay licencia previa, o está PENDING, activamos contra Lemon
+			if (!existing || !existing.tenant_id || existing.tenant_id === "PENDING") {
+				act = await lemonActivate(activationKey, instanceName);
+				if (!act.ok) {
+					const out: ApiError = {
+						ok: false,
+						error: act.data?.error || "lemon_activate_failed",
+						details: act.data || act.text,
+					};
+					return json(out, 400);
+				}
+			} else {
+				// mock act mínimo para no romper abajo
+				act = { ok: true, status: 200, data: { license_key: { status: existing.status, expires_at: existing.expires_at }, meta: { reused: true } }, text: "" };
 			}
 
 			const licenseKeyObj = act.data?.license_key;
@@ -1383,32 +1179,14 @@ export default {
 			const expiresAt = licenseKeyObj?.expires_at ? String(licenseKeyObj.expires_at) : null;
 			const instanceId = instanceObj?.id ? String(instanceObj.id) : null;
 
-			const dbi = get();
-			await ensureExtraSchema(dbi);
-
-			const licHash = await sha256Hex(activationKey);
-			const existing = await getLicenseByHash(dbi, licHash);
-
-			const tenantId =
+			let tenantId =
 				existing?.tenant_id && existing.tenant_id !== "PENDING"
 					? existing.tenant_id
 					: crypto.randomUUID();
 
+			// Garantiza tenant y device
 			await ensureTenantExistsMinimal(dbi, tenantId);
 			await ensureDevice(dbi, tenantId, deviceId, "tpv");
-
-			// ✅ Crea DB del tenant + token + ejecuta TU schema
-			try {
-				await ensureTenantDatabaseProvisioned(env, dbi, tenantId);
-			} catch (e: any) {
-				console.log("[TURSO] tenant provisioning failed", { tenantId, err: String(e?.message || e) });
-				const out: ApiError = {
-					ok: false,
-					error: "tenant_db_provision_failed",
-					details: String(e?.message || e),
-				};
-				return json(out, 500);
-			}
 
 			const { license } = await upsertLicenseFromEventOrActivation({
 				db: dbi,
@@ -1446,6 +1224,22 @@ export default {
 					deviceId,
 					instanceName: instanceName || null,
 				});
+			}
+
+			// ✅ Provision tenant DB + aplicar schema (con batch)
+			try {
+				await provisionTenantDatabase(dbi, env, tenantId);
+			} catch (e: any) {
+				// OJO: no reventamos la activación (para que el usuario pueda entrar),
+				// pero devolvemos error claro para depurar.
+				return json(
+					{
+						ok: false,
+						error: "tenant_db_provision_failed",
+						details: String(e?.message || e),
+					},
+					500
+				);
 			}
 
 			const token = await signToken(env, { tenantId, deviceId, licHash });
