@@ -1,5 +1,6 @@
 // src/server/index.ts
 import { SignJWT, jwtVerify } from "jose";
+import * as ed from "@noble/ed25519";
 import type {
 	ActivateRequest,
 	ActivateResponse,
@@ -19,6 +20,8 @@ import {
 	getDecryptedLicenseKey,
 	upsertWebhookEvent,
 	markWebhookProcessed,
+	getDevicePubKeyB64,
+	setDevicePubKeyB64IfEmptyOrThrow,
 } from "./licenseStore";
 import { sha256Hex } from "./crypto";
 
@@ -34,7 +37,6 @@ export interface Env extends TursoEnv {
 	// ✅ Turso Platform API (para crear DBs + tokens)
 	TURSO_PLATFORM_TOKEN: string; // Bearer token (platform)
 	TURSO_ORG_SLUG: string; // "altarialights" (slug de org o user)
-	// TURSO_GROUP?: string; // si quisieras, aquí lo dejaríamos; por ahora usamos "default"
 }
 
 // ---------------- Helpers ----------------
@@ -137,7 +139,7 @@ function toBool01(v: any, fallback = false): boolean {
 	return fallback;
 }
 
-// ---------------- AES-GCM (para turso_auth_token_enc) ----------------
+// ---------------- Base64 helpers ----------------
 
 function b64ToBytes(b64: string): Uint8Array {
 	const bin = atob(b64);
@@ -151,6 +153,8 @@ function bytesToB64(bytes: Uint8Array): string {
 	for (const b of bytes) bin += String.fromCharCode(b);
 	return btoa(bin);
 }
+
+// ---------------- AES-GCM (para turso_auth_token_enc) ----------------
 
 async function aesGcmEncryptToB64(keyB64: string, plaintext: string): Promise<string> {
 	const keyBytes = b64ToBytes(keyB64);
@@ -175,6 +179,58 @@ async function aesGcmDecryptFromB64(keyB64: string, payloadB64: string): Promise
 	const key = await crypto.subtle.importKey("raw", keyBytes, { name: "AES-GCM" }, false, ["decrypt"]);
 	const pt = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, data);
 	return new TextDecoder().decode(pt);
+}
+
+// ---------------- Device Proof (anti-copia) ----------------
+
+async function sha256HexStr(s: string): Promise<string> {
+	const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s));
+	return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+async function verifyDeviceProof(
+	request: Request,
+	dbi: ReturnType<typeof getDb>,
+	claims: { tenantId: string; deviceId: string }
+): Promise<{ ok: true } | { ok: false; error: string }> {
+	const tsStr = (request.headers.get("X-Device-Ts") || "").trim();
+	const sigB64 = (request.headers.get("X-Device-Sig") || "").trim();
+
+	if (!tsStr || !sigB64) return { ok: false, error: "missing_device_proof" };
+
+	const ts = Number(tsStr);
+	if (!Number.isFinite(ts)) return { ok: false, error: "bad_device_ts" };
+
+	const now = Date.now();
+	const MAX_SKEW_MS = 2 * 60 * 1000;
+	if (Math.abs(now - ts) > MAX_SKEW_MS) return { ok: false, error: "device_ts_out_of_range" };
+
+	const pubB64 = await getDevicePubKeyB64(dbi, claims.tenantId, claims.deviceId);
+	if (!pubB64) return { ok: false, error: "device_pubkey_not_registered" };
+
+	const auth = request.headers.get("authorization") || "";
+	const m = auth.match(/^Bearer\s+(.+)$/i);
+	if (!m) return { ok: false, error: "missing_token" };
+	const token = m[1];
+
+	const tokenHash = await sha256HexStr(token);
+
+	const url = new URL(request.url);
+	const msg = `${ts}\n${request.method.toUpperCase()}\n${url.pathname}\n${tokenHash}`;
+
+	let pub: Uint8Array;
+	let sig: Uint8Array;
+	try {
+		pub = b64ToBytes(pubB64);
+		sig = b64ToBytes(sigB64);
+	} catch {
+		return { ok: false, error: "bad_b64" };
+	}
+
+	const ok = await ed.verify(sig, new TextEncoder().encode(msg), pub);
+	if (!ok) return { ok: false, error: "bad_device_signature" };
+
+	return { ok: true };
 }
 
 // ---------------- Lemon License API ----------------
@@ -223,9 +279,6 @@ async function lemonValidate(licenseKey: string, instanceId?: string | null) {
 	return { ok: r.ok, status: r.status, data, text };
 }
 
-// ---------------- Tenant DB Provisioning (Turso Platform API) ----------------
-
-// ✅ Tu schema completo (tal cual lo has pasado). Lo ejecutamos por batch.
 const TPV_SCHEMA_SQL = String.raw`
 PRAGMA foreign_keys = ON;
 
@@ -877,7 +930,6 @@ function makeDbNameFromTenant(tenantId: string): string {
 }
 
 async function tursoCreateDatabase(env: Env, dbName: string): Promise<{ name: string; hostname: string; url: string }> {
-	// API: POST /v1/organizations/{organizationSlug}/databases :contentReference[oaicite:4]{index=4}
 	const r = await fetch(`https://api.turso.tech/v1/organizations/${encodeURIComponent(env.TURSO_ORG_SLUG)}/databases`, {
 		method: "POST",
 		headers: {
@@ -899,19 +951,16 @@ async function tursoCreateDatabase(env: Env, dbName: string): Promise<{ name: st
 		throw new Error(`turso_create_db_failed (${r.status}) ${text}`);
 	}
 
-	// docs devuelven { database: { Hostname, Name, DbId } } :contentReference[oaicite:5]{index=5}
 	const hostname = String(data?.database?.Hostname || data?.database?.hostname || "");
 	const name = String(data?.database?.Name || data?.database?.name || dbName);
 
 	if (!hostname) throw new Error(`turso_create_db_failed_missing_hostname ${text}`);
 
-	// URL libsql para SDK
 	const url = `libsql://${hostname}`;
 	return { name, hostname, url };
 }
 
 async function tursoCreateDbToken(env: Env, dbName: string): Promise<string> {
-	// Platform API: POST /v1/organizations/{org}/databases/{db}/auth/tokens :contentReference[oaicite:6]{index=6}
 	const r = await fetch(
 		`https://api.turso.tech/v1/organizations/${encodeURIComponent(env.TURSO_ORG_SLUG)}/databases/${encodeURIComponent(
 			dbName
@@ -973,18 +1022,14 @@ async function applyTenantSchemaOnce(tursoUrl: string, token: string): Promise<v
 		authToken: token,
 	});
 
-	// ✅ Batch: una sola llamada a la DB en vez de N executes
-	// (evita "Too many subrequests" del Worker) :contentReference[oaicite:7]{index=7}
 	const stmts = splitSqlStatements(TPV_SCHEMA_SQL)
 		.map((s) => s.trim())
 		.filter(Boolean);
 
-	// ojo: batch acepta strings o objetos {sql,args}
 	await client.batch(stmts, "write");
 }
 
 async function provisionTenantDatabase(dbi: ReturnType<typeof getDb>, env: Env, tenantId: string) {
-	// Si ya hay row, reusar (idempotente)
 	const existing = await getTenantDbRow(dbi, tenantId);
 
 	if (existing?.turso_url && existing?.turso_auth_token_enc) {
@@ -993,7 +1038,6 @@ async function provisionTenantDatabase(dbi: ReturnType<typeof getDb>, env: Env, 
 		return { reused: true, dbName: String(existing.turso_db_name || ""), url: String(existing.turso_url) };
 	}
 
-	// Si no existe, crear DB + token + guardar + aplicar schema
 	const dbName = makeDbNameFromTenant(tenantId);
 
 	const created = await tursoCreateDatabase(env, dbName);
@@ -1122,7 +1166,7 @@ export default {
 			const err = requireJson(request);
 			if (err) return err;
 
-			const body = await readJsonSafe<ActivateRequest>(
+			const body = await readJsonSafe<ActivateRequest & { devicePubKey?: string }>(
 				request,
 				{
 					activationKey: "",
@@ -1137,6 +1181,12 @@ export default {
 			const reqDeviceId = String((body as any).deviceId || "").trim();
 			const deviceId = reqDeviceId || crypto.randomUUID();
 
+			// ✅ NUEVO: devicePubKey (obligatoria para anti-copia)
+			const devicePubKey = String((body as any).devicePubKey || "").trim();
+			if (!devicePubKey) {
+				return json({ ok: false, error: "devicePubKey required" }, 400);
+			}
+
 			// ✅ instanceName: si no viene, lo generamos a partir del deviceId
 			const reqInstanceName = String((body as any).instanceName || "").trim();
 			const instanceName = reqInstanceName || `tpv-${deviceId.slice(0, 12)}`;
@@ -1150,13 +1200,11 @@ export default {
 			await ensureExtraSchema(dbi);
 
 			// ✅ Idempotencia antes de tocar Lemon:
-			// Si esta activationKey ya existe y tiene tenant asignado, NO volvemos a activar (evita activation_limit=1)
 			const licHash = await sha256Hex(activationKey);
 			const existing = await getLicenseByHash(dbi, licHash);
 
 			let act: { ok: boolean; status: number; data: any; text: string } | null = null;
 
-			// Si no hay licencia previa, o está PENDING, activamos contra Lemon
 			if (!existing || !existing.tenant_id || existing.tenant_id === "PENDING") {
 				act = await lemonActivate(activationKey, instanceName);
 				if (!act.ok) {
@@ -1168,8 +1216,12 @@ export default {
 					return json(out, 400);
 				}
 			} else {
-				// mock act mínimo para no romper abajo
-				act = { ok: true, status: 200, data: { license_key: { status: existing.status, expires_at: existing.expires_at }, meta: { reused: true } }, text: "" };
+				act = {
+					ok: true,
+					status: 200,
+					data: { license_key: { status: existing.status, expires_at: existing.expires_at }, meta: { reused: true } },
+					text: "",
+				};
 			}
 
 			const licenseKeyObj = act.data?.license_key;
@@ -1186,7 +1238,13 @@ export default {
 
 			// Garantiza tenant y device
 			await ensureTenantExistsMinimal(dbi, tenantId);
-			await ensureDevice(dbi, tenantId, deviceId, "tpv");
+
+			// ✅ ensureDevice ahora también guarda pubkey si procede (y controla mismatch)
+			await ensureDevice(dbi, tenantId, deviceId, "tpv", devicePubKey);
+
+			// ✅ extra seguridad: si ya existía key distinta, esto lanza 409
+			// (por si en algún camino no pasó por ensureDevice)
+			await setDevicePubKeyB64IfEmptyOrThrow(dbi, tenantId, deviceId, devicePubKey);
 
 			const { license } = await upsertLicenseFromEventOrActivation({
 				db: dbi,
@@ -1230,8 +1288,6 @@ export default {
 			try {
 				await provisionTenantDatabase(dbi, env, tenantId);
 			} catch (e: any) {
-				// OJO: no reventamos la activación (para que el usuario pueda entrar),
-				// pero devolvemos error claro para depurar.
 				return json(
 					{
 						ok: false,
@@ -1275,6 +1331,10 @@ export default {
 			const dbi = get();
 			await ensureExtraSchema(dbi);
 
+			// ✅ NUEVO: proof obligatorio
+			const proof = await verifyDeviceProof(request, dbi, { tenantId: claims.tenantId, deviceId: claims.deviceId });
+			if (!proof.ok) return json({ ok: false, error: proof.error }, 401);
+
 			const lic = await getLicenseByHash(dbi, claims.licHash);
 			if (!lic) return json({ ok: false, error: "not_found" }, 404);
 
@@ -1317,6 +1377,10 @@ export default {
 
 			const dbi = get();
 			await ensureExtraSchema(dbi);
+
+			// ✅ NUEVO: proof obligatorio
+			const proof = await verifyDeviceProof(request, dbi, { tenantId: claims.tenantId, deviceId: claims.deviceId });
+			if (!proof.ok) return json({ ok: false, error: proof.error }, 401);
 
 			const dec = await getDecryptedLicenseKey(dbi, env.LICENSE_STORE_KEY, claims.licHash);
 			if (!dec) return json({ ok: false, error: "not_found" }, 404);

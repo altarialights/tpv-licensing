@@ -34,9 +34,39 @@ export type LicenseRow = {
 	updated_at_ms: number;
 };
 
+// --- schema helpers
+
+async function columnExists(db: Client, table: string, col: string): Promise<boolean> {
+	const r = await exec(db, `PRAGMA table_info(${table});`, []);
+	for (const row of r.rows || []) {
+		const name = String((row as any).name || "");
+		if (name === col) return true;
+	}
+	return false;
+}
+
+async function ensureDeviceKeyColumns(db: Client) {
+	// devices.device_pubkey_b64 + devices.pubkey_alg
+	try {
+		const hasPub = await columnExists(db, "devices", "device_pubkey_b64");
+		if (!hasPub) {
+			await exec(db, `ALTER TABLE devices ADD COLUMN device_pubkey_b64 TEXT;`, []);
+		}
+		const hasAlg = await columnExists(db, "devices", "pubkey_alg");
+		if (!hasAlg) {
+			await exec(db, `ALTER TABLE devices ADD COLUMN pubkey_alg TEXT;`, []);
+		}
+	} catch (e) {
+		// si la tabla devices no existe aún en tu DB de licensing, esto fallaría.
+		// En tu caso ya existe (estás usando ensureDevice), así que debería ir bien.
+		console.log("[schema] ensureDeviceKeyColumns failed", String((e as any)?.message || e));
+		throw e;
+	}
+}
+
 export async function ensureExtraSchema(db: Client) {
 	// ✅ Tu schema principal ya lo has creado en Turso.
-	// Solo añadimos un “extra” para guardar meta_json como antes (opcional).
+	// Solo añadimos extras para meta_json + device keys.
 	await exec(
 		db,
 		`
@@ -48,7 +78,46 @@ export async function ensureExtraSchema(db: Client) {
     );
     `
 	);
+
+	// ✅ NUEVO: columnas para anti-copia (pubkey del dispositivo)
+	await ensureDeviceKeyColumns(db);
 }
+
+// --- device pubkey helpers
+
+export async function getDevicePubKeyB64(db: Client, tenantId: string, deviceId: string): Promise<string | null> {
+	const r = await exec(
+		db,
+		`SELECT device_pubkey_b64 FROM devices WHERE tenant_id=? AND device_id=? LIMIT 1;`,
+		[tenantId, deviceId]
+	);
+	const row = (r.rows?.[0] as any) || null;
+	const v = row ? String(row.device_pubkey_b64 || "").trim() : "";
+	return v ? v : null;
+}
+
+/**
+ * Guarda pubkey solo si está vacía.
+ * Si ya hay una distinta => lanza error (anti-clonado/mismatch).
+ */
+export async function setDevicePubKeyB64IfEmptyOrThrow(db: Client, tenantId: string, deviceId: string, pubB64: string) {
+	const cur = await getDevicePubKeyB64(db, tenantId, deviceId);
+	if (!cur) {
+		await exec(
+			db,
+			`UPDATE devices SET device_pubkey_b64=?, pubkey_alg='ed25519' WHERE tenant_id=? AND device_id=?;`,
+			[pubB64, tenantId, deviceId]
+		);
+		return;
+	}
+	if (cur !== pubB64) {
+		const err: any = new Error("device_key_mismatch");
+		err.code = "device_key_mismatch";
+		throw err;
+	}
+}
+
+// --- licenses
 
 export async function getLicenseByHash(db: Client, licHash: string): Promise<LicenseRow | null> {
 	const r = await exec(db, `SELECT * FROM licenses WHERE license_key_hash = ? LIMIT 1;`, [licHash]);
@@ -79,7 +148,6 @@ export async function upsertLicenseMeta(db: Client, licenseId: string, meta: any
 }
 
 export async function ensureTenantExistsMinimal(db: Client, tenantId: string) {
-	// “Upsert” mínimo (por si activas sin tener el tenant todavía).
 	const now = Date.now();
 	await exec(
 		db,
@@ -93,8 +161,21 @@ export async function ensureTenantExistsMinimal(db: Client, tenantId: string) {
 	);
 }
 
-export async function ensureDevice(db: Client, tenantId: string, deviceId: string, role: "tpv" | "handy" = "tpv") {
+/**
+ * ✅ MOD: ahora acepta pubkey opcional.
+ * - Si viene pubkey:
+ *   - si no hay pubkey => se guarda
+ *   - si hay distinta => error (device_key_mismatch)
+ */
+export async function ensureDevice(
+	db: Client,
+	tenantId: string,
+	deviceId: string,
+	role: "tpv" | "handy" = "tpv",
+	devicePubKeyB64?: string | null
+) {
 	const now = Date.now();
+
 	await exec(
 		db,
 		`
@@ -107,6 +188,10 @@ export async function ensureDevice(db: Client, tenantId: string, deviceId: strin
     `,
 		[deviceId, tenantId, role, now, now]
 	);
+
+	if (devicePubKeyB64 && devicePubKeyB64.trim()) {
+		await setDevicePubKeyB64IfEmptyOrThrow(db, tenantId, deviceId, devicePubKeyB64.trim());
+	}
 }
 
 export async function upsertLicenseFromEventOrActivation(params: {
@@ -278,7 +363,6 @@ export async function upsertWebhookEvent(db: Client, args: {
 }) {
 	const now = Date.now();
 
-	// idempotencia: si ya existe, no re-procesamos
 	const existing = await exec(db, `SELECT processed_ok FROM webhook_events WHERE event_uid=? LIMIT 1;`, [args.event_uid]);
 	if (existing.rows?.length) return { already: true };
 
