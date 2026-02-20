@@ -27,7 +27,20 @@ import { sha256Hex } from "./crypto";
 export interface Env extends TursoEnv {
 	LEMON_WEBHOOK_SECRET: string;
 	LICENSE_JWT_SECRET: string;
-	LICENSE_STORE_KEY: string; // base64 32 bytes (AES-GCM)
+
+	/**
+	 * Base64 32 bytes (AES-GCM)
+	 * Lo reutilizamos para cifrar también tokens de tenant DB.
+	 */
+	LICENSE_STORE_KEY: string;
+
+	/**
+	 * Turso Platform API (para crear DB y tokens)
+	 */
+	TURSO_ORG_SLUG: string;        // ej: "altarialights"
+	TURSO_PLATFORM_TOKEN: string;  // API token de Turso Platform API
+	TURSO_GROUP?: string;          // opcional (si no existe => "default")
+	TURSO_TOKEN_TTL?: string;      // opcional, ej "7d"
 }
 
 // ---------------- Helpers ----------------
@@ -67,7 +80,10 @@ function assertEnv(env: Env, names: (keyof Env)[]) {
 	return null;
 }
 
-async function signToken(env: Env, claims: { tenantId: string; deviceId: string; licHash: string }) {
+async function signToken(
+	env: Env,
+	claims: { tenantId: string; deviceId: string; licHash: string }
+) {
 	return await new SignJWT(claims)
 		.setProtectedHeader({ alg: "HS256", typ: "JWT" })
 		.setIssuedAt()
@@ -113,9 +129,452 @@ async function verifyLemonSignature(req: Request, secret: string, rawBody: strin
 	);
 
 	const mac = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(rawBody));
-	const hex = [...new Uint8Array(mac)].map((b) => b.toString(16).padStart(2, "0")).join("");
+	const hex = [...new Uint8Array(mac)]
+		.map((b) => b.toString(16).padStart(2, "0"))
+		.join("");
 
 	return timingSafeEqualHex(hex, sig);
+}
+
+// ---------------- libsql exec helper (compat) ----------------
+
+async function execSql(db: any, sql: string, args: any[] = []) {
+	try {
+		return await db.execute({ sql, args });
+	} catch {
+		return await db.execute(sql, args);
+	}
+}
+
+// ---------------- Base64 helpers ----------------
+
+function b64ToBytes(b64: string): Uint8Array {
+	const bin = atob(b64);
+	const bytes = new Uint8Array(bin.length);
+	for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+	return bytes;
+}
+
+function bytesToB64(bytes: Uint8Array): string {
+	let bin = "";
+	for (const b of bytes) bin += String.fromCharCode(b);
+	return btoa(bin);
+}
+
+// ---------------- AES-GCM encrypt/decrypt (token storage) ----------------
+
+async function aesGcmEncryptB64(keyB64: string, plaintext: string): Promise<string> {
+	const keyBytes = b64ToBytes(keyB64);
+	if (keyBytes.length !== 32) throw new Error("LICENSE_STORE_KEY must be 32 bytes (base64)");
+
+	const key = await crypto.subtle.importKey("raw", keyBytes, "AES-GCM", false, ["encrypt"]);
+	const iv = crypto.getRandomValues(new Uint8Array(12));
+	const pt = new TextEncoder().encode(plaintext);
+
+	const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, pt));
+
+	const out = new Uint8Array(iv.length + ct.length);
+	out.set(iv, 0);
+	out.set(ct, iv.length);
+	return "v1:" + bytesToB64(out);
+}
+
+async function aesGcmDecryptB64(keyB64: string, blob: string): Promise<string> {
+	if (!blob.startsWith("v1:")) throw new Error("unknown_cipher_version");
+	const raw = b64ToBytes(blob.slice(3));
+	const iv = raw.slice(0, 12);
+	const ct = raw.slice(12);
+
+	const keyBytes = b64ToBytes(keyB64);
+	if (keyBytes.length !== 32) throw new Error("LICENSE_STORE_KEY must be 32 bytes (base64)");
+
+	const key = await crypto.subtle.importKey("raw", keyBytes, "AES-GCM", false, ["decrypt"]);
+	const pt = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, ct);
+	return new TextDecoder().decode(pt);
+}
+
+// ---------------- Turso Platform API ----------------
+
+const TURSO_API_BASE = "https://api.turso.tech/v1";
+
+async function tursoCreateDatabase(env: Env, dbName: string) {
+	const group =
+		env.TURSO_GROUP && env.TURSO_GROUP.trim().length > 0
+			? env.TURSO_GROUP.trim()
+			: "default";
+
+	const r = await fetch(
+		`${TURSO_API_BASE}/organizations/${encodeURIComponent(env.TURSO_ORG_SLUG)}/databases`,
+		{
+			method: "POST",
+			headers: {
+				Authorization: `Bearer ${env.TURSO_PLATFORM_TOKEN}`,
+				"content-type": "application/json",
+				Accept: "application/json",
+			},
+			body: JSON.stringify({ name: dbName, group }),
+		}
+	);
+
+	const text = await r.text();
+	let data: any = null;
+	try {
+		data = JSON.parse(text);
+	} catch { }
+	return { ok: r.ok, status: r.status, data, text };
+}
+
+async function tursoGetDatabase(env: Env, dbName: string) {
+	const r = await fetch(
+		`${TURSO_API_BASE}/organizations/${encodeURIComponent(
+			env.TURSO_ORG_SLUG
+		)}/databases/${encodeURIComponent(dbName)}`,
+		{
+			method: "GET",
+			headers: {
+				Authorization: `Bearer ${env.TURSO_PLATFORM_TOKEN}`,
+				Accept: "application/json",
+			},
+		}
+	);
+	const text = await r.text();
+	let data: any = null;
+	try {
+		data = JSON.parse(text);
+	} catch { }
+	return { ok: r.ok, status: r.status, data, text };
+}
+
+async function tursoCreateDbToken(env: Env, dbName: string, expiration: string) {
+	const url =
+		`${TURSO_API_BASE}/organizations/${encodeURIComponent(env.TURSO_ORG_SLUG)}` +
+		`/databases/${encodeURIComponent(dbName)}/auth/tokens` +
+		`?expiration=${encodeURIComponent(expiration)}&authorization=full-access`;
+
+	const r = await fetch(url, {
+		method: "POST",
+		headers: {
+			Authorization: `Bearer ${env.TURSO_PLATFORM_TOKEN}`,
+			Accept: "application/json",
+		},
+	});
+
+	const text = await r.text();
+	let data: any = null;
+	try {
+		data = JSON.parse(text);
+	} catch { }
+	return { ok: r.ok, status: r.status, data, text };
+}
+
+function approxTtlToMs(ttl: string): number | null {
+	const s = ttl.trim().toLowerCase();
+	const m = s.match(/^(\d+)\s*([mhdw])$/);
+	if (!m) return null;
+	const n = parseInt(m[1], 10);
+	const unit = m[2];
+	const minute = 60_000;
+	const hour = 60 * minute;
+	const day = 24 * hour;
+	const week = 7 * day;
+	switch (unit) {
+		case "m":
+			return n * minute;
+		case "h":
+			return n * hour;
+		case "d":
+			return n * day;
+		case "w":
+			return n * week;
+		default:
+			return null;
+	}
+}
+
+// ---------------- Tenant DB provisioning / rotation ----------------
+
+function normalizeDbName(tenantId: string) {
+	const t = tenantId.toLowerCase();
+	return `tpv-${t}`.slice(0, 64);
+}
+
+async function getTenantDbRow(dbi: any, tenantId: string) {
+	const r = await execSql(
+		dbi,
+		`SELECT tenant_id, turso_db_name, turso_url, turso_auth_token_enc,
+		        token_expires_at_ms, provisioning_status, last_error, rotated_at_ms
+		   FROM tenant_databases
+		  WHERE tenant_id = ?`,
+		[tenantId]
+	);
+
+	const rows = (r?.rows || r?.result?.rows || []) as any[];
+	return rows.length ? rows[0] : null;
+}
+
+async function upsertTenantDbRow(dbi: any, row: {
+	tenantId: string;
+	dbName: string | null;
+	url: string | null;
+	tokenEnc: string | null;
+	tokenExpiresAtMs: number | null;
+	status: "creating" | "ready" | "error";
+	lastError: string | null;
+	rotatedAtMs?: number | null;
+}) {
+	const now = Date.now();
+	await execSql(
+		dbi,
+		`INSERT INTO tenant_databases
+		 (tenant_id, turso_db_name, turso_url, turso_auth_token_enc,
+		  token_expires_at_ms, provisioning_status, last_error, created_at_ms, rotated_at_ms)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, COALESCE((SELECT created_at_ms FROM tenant_databases WHERE tenant_id = ?), ?), ?)
+		 ON CONFLICT(tenant_id) DO UPDATE SET
+		   turso_db_name = excluded.turso_db_name,
+		   turso_url = excluded.turso_url,
+		   turso_auth_token_enc = excluded.turso_auth_token_enc,
+		   token_expires_at_ms = excluded.token_expires_at_ms,
+		   provisioning_status = excluded.provisioning_status,
+		   last_error = excluded.last_error,
+		   rotated_at_ms = excluded.rotated_at_ms`,
+		[
+			row.tenantId,
+			row.dbName,
+			row.url,
+			row.tokenEnc,
+			row.tokenExpiresAtMs,
+			row.status,
+			row.lastError,
+			row.tenantId,
+			now,
+			row.rotatedAtMs ?? null,
+		]
+	);
+}
+
+async function ensureTenantDatabaseProvisioned(env: Env, dbi: any, tenantId: string) {
+	const ttl =
+		env.TURSO_TOKEN_TTL && env.TURSO_TOKEN_TTL.trim().length > 0
+			? env.TURSO_TOKEN_TTL.trim()
+			: "7d";
+	const ttlMs = approxTtlToMs(ttl);
+	const rotateBeforeMs = 24 * 60 * 60 * 1000;
+
+	const current = await getTenantDbRow(dbi, tenantId);
+
+	if (current && current.provisioning_status === "ready" && current.turso_url && current.turso_auth_token_enc) {
+		const exp = current.token_expires_at_ms ? Number(current.token_expires_at_ms) : null;
+		if (exp && exp - Date.now() > rotateBeforeMs) {
+			return { ok: true, dbName: String(current.turso_db_name || ""), url: String(current.turso_url || ""), rotated: false };
+		}
+		// exp no existe o expira pronto -> rotamos
+	}
+
+	await upsertTenantDbRow(dbi, {
+		tenantId,
+		dbName: current?.turso_db_name ? String(current.turso_db_name) : normalizeDbName(tenantId),
+		url: current?.turso_url ? String(current.turso_url) : null,
+		tokenEnc: current?.turso_auth_token_enc ? String(current.turso_auth_token_enc) : null,
+		tokenExpiresAtMs: current?.token_expires_at_ms ? Number(current.token_expires_at_ms) : null,
+		status: "creating",
+		lastError: null,
+		rotatedAtMs: current?.rotated_at_ms ? Number(current.rotated_at_ms) : null,
+	});
+
+	const dbName = current?.turso_db_name ? String(current.turso_db_name) : normalizeDbName(tenantId);
+
+	// 1) si no tenemos url, intentamos crear o recuperar DB
+	if (!current || !current.turso_url) {
+		const created = await tursoCreateDatabase(env, dbName);
+
+		let hostname =
+			created.data?.database?.Hostname ||
+			created.data?.database?.hostname ||
+			created.data?.Hostname ||
+			created.data?.hostname ||
+			null;
+
+		if (!created.ok || !hostname) {
+			// puede existir ya -> GET
+			const got = await tursoGetDatabase(env, dbName);
+			if (!got.ok) {
+				const errTxt = `create_db_failed status=${created.status} / get_db_failed status=${got.status}`;
+				await upsertTenantDbRow(dbi, {
+					tenantId,
+					dbName,
+					url: null,
+					tokenEnc: null,
+					tokenExpiresAtMs: null,
+					status: "error",
+					lastError: errTxt,
+					rotatedAtMs: null,
+				});
+				throw new Error(errTxt);
+			}
+			hostname =
+				got.data?.database?.Hostname ||
+				got.data?.database?.hostname ||
+				got.data?.Hostname ||
+				got.data?.hostname ||
+				null;
+
+			if (!hostname) {
+				const errTxt = "get_db_missing_hostname";
+				await upsertTenantDbRow(dbi, {
+					tenantId,
+					dbName,
+					url: null,
+					tokenEnc: null,
+					tokenExpiresAtMs: null,
+					status: "error",
+					lastError: errTxt,
+					rotatedAtMs: null,
+				});
+				throw new Error(errTxt);
+			}
+		}
+
+		const url = String(hostname).startsWith("libsql://")
+			? String(hostname)
+			: `libsql://${hostname}`;
+
+		// 2) token
+		const tok = await tursoCreateDbToken(env, dbName, ttl);
+		if (!tok.ok) {
+			const errTxt = `create_token_failed status=${tok.status}`;
+			await upsertTenantDbRow(dbi, {
+				tenantId,
+				dbName,
+				url,
+				tokenEnc: null,
+				tokenExpiresAtMs: null,
+				status: "error",
+				lastError: errTxt,
+				rotatedAtMs: null,
+			});
+			throw new Error(errTxt);
+		}
+
+		const tokenPlain = tok.data?.jwt || tok.data?.token || tok.data?.Token || tok.data?.authToken;
+		if (!tokenPlain) {
+			const errTxt = "create_token_missing_jwt";
+			await upsertTenantDbRow(dbi, {
+				tenantId,
+				dbName,
+				url,
+				tokenEnc: null,
+				tokenExpiresAtMs: null,
+				status: "error",
+				lastError: errTxt,
+				rotatedAtMs: null,
+			});
+			throw new Error(errTxt);
+		}
+
+		const tokenEnc = await aesGcmEncryptB64(env.LICENSE_STORE_KEY, String(tokenPlain));
+		const expMs = ttlMs ? Date.now() + ttlMs : null;
+
+		await upsertTenantDbRow(dbi, {
+			tenantId,
+			dbName,
+			url,
+			tokenEnc,
+			tokenExpiresAtMs: expMs,
+			status: "ready",
+			lastError: null,
+			rotatedAtMs: Date.now(),
+		});
+
+		return { ok: true, dbName, url, rotated: true };
+	}
+
+	// si tenemos URL, rotamos token (o lo creamos si falta)
+	const url = String(current.turso_url);
+	const tok = await tursoCreateDbToken(env, dbName, ttl);
+	if (!tok.ok) {
+		const errTxt = `rotate_token_failed status=${tok.status}`;
+		await upsertTenantDbRow(dbi, {
+			tenantId,
+			dbName,
+			url,
+			tokenEnc: current.turso_auth_token_enc ? String(current.turso_auth_token_enc) : null,
+			tokenExpiresAtMs: current.token_expires_at_ms ? Number(current.token_expires_at_ms) : null,
+			status: "error",
+			lastError: errTxt,
+			rotatedAtMs: current.rotated_at_ms ? Number(current.rotated_at_ms) : null,
+		});
+		throw new Error(errTxt);
+	}
+
+	const tokenPlain = tok.data?.jwt || tok.data?.token || tok.data?.Token || tok.data?.authToken;
+	if (!tokenPlain) {
+		const errTxt = "rotate_token_missing_jwt";
+		await upsertTenantDbRow(dbi, {
+			tenantId,
+			dbName,
+			url,
+			tokenEnc: null,
+			tokenExpiresAtMs: null,
+			status: "error",
+			lastError: errTxt,
+			rotatedAtMs: null,
+		});
+		throw new Error(errTxt);
+	}
+
+	const tokenEnc = await aesGcmEncryptB64(env.LICENSE_STORE_KEY, String(tokenPlain));
+	const expMs = ttlMs ? Date.now() + ttlMs : null;
+
+	await upsertTenantDbRow(dbi, {
+		tenantId,
+		dbName,
+		url,
+		tokenEnc,
+		tokenExpiresAtMs: expMs,
+		status: "ready",
+		lastError: null,
+		rotatedAtMs: Date.now(),
+	});
+
+	return { ok: true, dbName, url, rotated: true };
+}
+
+async function rotateTenantDbTokenNow(env: Env, dbi: any, tenantId: string) {
+	const row = await getTenantDbRow(dbi, tenantId);
+	if (!row?.turso_db_name || !row?.turso_url) {
+		throw new Error("tenant_db_not_provisioned");
+	}
+
+	const ttl =
+		env.TURSO_TOKEN_TTL && env.TURSO_TOKEN_TTL.trim().length > 0
+			? env.TURSO_TOKEN_TTL.trim()
+			: "7d";
+	const ttlMs = approxTtlToMs(ttl);
+
+	const dbName = String(row.turso_db_name);
+	const url = String(row.turso_url);
+
+	const tok = await tursoCreateDbToken(env, dbName, ttl);
+	if (!tok.ok) throw new Error(`create_token_failed status=${tok.status}`);
+
+	const tokenPlain = tok.data?.jwt || tok.data?.token || tok.data?.Token || tok.data?.authToken;
+	if (!tokenPlain) throw new Error("create_token_missing_jwt");
+
+	const tokenEnc = await aesGcmEncryptB64(env.LICENSE_STORE_KEY, String(tokenPlain));
+	const expMs = ttlMs ? Date.now() + ttlMs : null;
+
+	await upsertTenantDbRow(dbi, {
+		tenantId,
+		dbName,
+		url,
+		tokenEnc,
+		tokenExpiresAtMs: expMs,
+		status: "ready",
+		lastError: null,
+		rotatedAtMs: Date.now(),
+	});
+
+	return { ok: true, tokenExpiresAtMs: expMs, rotatedAtMs: Date.now() };
 }
 
 // ---------------- Lemon License API ----------------
@@ -136,7 +595,9 @@ async function lemonActivate(licenseKey: string, instanceName: string) {
 
 	const text = await r.text();
 	let data: any = null;
-	try { data = JSON.parse(text); } catch { }
+	try {
+		data = JSON.parse(text);
+	} catch { }
 	return { ok: r.ok, status: r.status, data, text };
 }
 
@@ -156,7 +617,9 @@ async function lemonValidate(licenseKey: string, instanceId?: string | null) {
 
 	const text = await r.text();
 	let data: any = null;
-	try { data = JSON.parse(text); } catch { }
+	try {
+		data = JSON.parse(text);
+	} catch { }
 	return { ok: r.ok, status: r.status, data, text };
 }
 
@@ -179,7 +642,12 @@ export default {
 
 		// 1) WEBHOOK Lemon
 		if (url.pathname === "/v1/webhooks/lemon" && request.method === "POST") {
-			const miss = assertEnv(env, ["LEMON_WEBHOOK_SECRET", "TURSO_DATABASE_URL", "TURSO_AUTH_TOKEN", "LICENSE_STORE_KEY"]);
+			const miss = assertEnv(env, [
+				"LEMON_WEBHOOK_SECRET",
+				"TURSO_DATABASE_URL",
+				"TURSO_AUTH_TOKEN",
+				"LICENSE_STORE_KEY",
+			]);
 			if (miss) return json({ ok: false, error: miss }, 500);
 
 			const raw = await request.text();
@@ -268,6 +736,8 @@ export default {
 				"LICENSE_STORE_KEY",
 				"TURSO_DATABASE_URL",
 				"TURSO_AUTH_TOKEN",
+				"TURSO_ORG_SLUG",
+				"TURSO_PLATFORM_TOKEN",
 			]);
 			if (miss) return json({ ok: false, error: miss }, 500);
 
@@ -276,18 +746,15 @@ export default {
 
 			const body = await readJsonSafe<ActivateRequest>(request, {
 				activationKey: "",
-				deviceId: "",          // puede venir vacío
-				instanceName: undefined // puede venir undefined
+				deviceId: "",
+				instanceName: undefined,
 			} as any);
 
 			const activationKey = String((body as any).activationKey || "").trim();
 
-			// ✅ deviceId: si viene (porque ya fue generado por el Worker en el pasado), lo respetamos.
-			// ✅ si NO viene, lo generamos aquí (Worker es la fuente de verdad).
 			const reqDeviceId = String((body as any).deviceId || "").trim();
 			const deviceId = reqDeviceId || crypto.randomUUID();
 
-			// ✅ instanceName: si no viene, lo generamos a partir del deviceId server-side
 			const reqInstanceName = String((body as any).instanceName || "").trim();
 			const instanceName = reqInstanceName || `tpv-${deviceId.slice(0, 12)}`;
 
@@ -324,9 +791,21 @@ export default {
 					? existing.tenant_id
 					: crypto.randomUUID();
 
-			// Garantiza tenant y device (deviceId ya es el “server-generated” o uno previo server-generated)
 			await ensureTenantExistsMinimal(dbi, tenantId);
 			await ensureDevice(dbi, tenantId, deviceId, "tpv");
+
+			// ✅ Provisiona DB por tenant (idempotente) + token cifrado
+			try {
+				await ensureTenantDatabaseProvisioned(env, dbi, tenantId);
+			} catch (e: any) {
+				console.log("[TURSO] provisioning failed", { tenantId, err: String(e?.message || e) });
+				const out: ApiError = {
+					ok: false,
+					error: "tenant_db_provision_failed",
+					details: String(e?.message || e),
+				};
+				return json(out, 500);
+			}
 
 			const { license } = await upsertLicenseFromEventOrActivation({
 				db: dbi,
@@ -368,7 +847,6 @@ export default {
 
 			const token = await signToken(env, { tenantId, deviceId, licHash });
 
-			// ✅ incluimos deviceId para que la TPV lo guarde (y nunca lo genere)
 			const out: ActivateResponse & { deviceId: string } = {
 				ok: true,
 				tenantId,
@@ -469,6 +947,40 @@ export default {
 			});
 
 			return json({ ok: true, status, expiresAt, valid: val.data?.valid, meta: val.data?.meta });
+		}
+
+		// 5) ROTATE TENANT DB TOKEN (manual, sin /activate)
+		if (url.pathname === "/v1/tenant/rotate-token" && request.method === "POST") {
+			const miss = assertEnv(env, [
+				"LICENSE_JWT_SECRET",
+				"LICENSE_STORE_KEY",
+				"TURSO_DATABASE_URL",
+				"TURSO_AUTH_TOKEN",
+				"TURSO_ORG_SLUG",
+				"TURSO_PLATFORM_TOKEN",
+			]);
+			if (miss) return json({ ok: false, error: miss }, 500);
+
+			const h = request.headers.get("authorization") || "";
+			const m = h.match(/^Bearer\s+(.+)$/i);
+			if (!m) return json({ ok: false, error: "missing_token" }, 401);
+
+			let claims: { tenantId: string; deviceId: string; licHash: string };
+			try {
+				claims = await verifyToken(env, m[1]);
+			} catch {
+				return json({ ok: false, error: "invalid_token" }, 401);
+			}
+
+			const dbi = get();
+			await ensureExtraSchema(dbi);
+
+			try {
+				const res = await rotateTenantDbTokenNow(env, dbi, claims.tenantId);
+				return json({ tenantId: claims.tenantId, ...res });
+			} catch (e: any) {
+				return json({ ok: false, error: "rotate_failed", details: String(e?.message || e) }, 500);
+			}
 		}
 
 		return new Response("Not found", { status: 404 });

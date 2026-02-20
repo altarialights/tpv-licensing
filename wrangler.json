@@ -7,20 +7,8 @@
 	},
 	"upload_source_maps": true,
 	"vars": {
-		"TURSO_DATABASE_URL": "libsql://tpvcontrol-altarialights.aws-eu-west-1.turso.io"
-	},
-	"migrations": [
-		{
-			"tag": "v1",
-			"new_sqlite_classes": [
-				"Chat"
-			]
-		},
-		{
-			"tag": "v2",
-			"deleted_classes": [
-				"Chat"
-			]
-		}
-	]
+		"TURSO_DATABASE_URL": "libsql://tpvcontrol-altarialights.aws-eu-west-1.turso.io",
+		"TURSO_ORG_SLUG": "altarialights",
+		"TURSO_TOKEN_TTL": "7d"
+	}
 }
